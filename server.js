@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 
 // ✅ CAMBIO 2: ruta raíz para que Azure no muestre "Cannot GET /"
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 const credential = new DefaultAzureCredential(); // ✅ CAMBIO 1
