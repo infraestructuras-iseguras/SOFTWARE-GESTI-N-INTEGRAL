@@ -26,13 +26,15 @@ async function conectarDB() {
   try {
     if (pool) { try { await pool.close(); } catch(e) {} }
     const token = (await credential.getToken('https://database.windows.net/.default')).token;
+    const DB_SERVER   = process.env.DB_SERVER   || 'azure-iseguras.database.windows.net';
+    const DB_DATABASE = process.env.DB_DATABASE || 'PruebaAplicacion';
     pool = await sql.connect({
-      server: process.env.DB_SERVER, database: process.env.DB_DATABASE,
+      server: DB_SERVER, database: DB_DATABASE,
       options: { encrypt: true, trustServerCertificate: false },
       authentication: { type: 'azure-active-directory-access-token', options: { token } },
       connectionTimeout: 30000, requestTimeout: 60000
     });
-    console.log('✅ Conectado a:', process.env.DB_DATABASE);
+    console.log('✅ Conectado a:', DB_DATABASE);
     return true;
   } catch(err) { console.error('❌ Conexión:', err.message); pool = null; return false; }
 }
