@@ -3,7 +3,7 @@ const sql      = require('mssql');
 const cors     = require('cors');
 const path     = require('path');
 require('dotenv').config();
-const { AzureCliCredential } = require('@azure/identity');
+const { DefaultAzureCredential } = require('@azure/identity'); // ✅ CAMBIO 1
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -14,7 +14,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const credential = new AzureCliCredential();
+// ✅ CAMBIO 2: ruta raíz para que Azure no muestre "Cannot GET /"
+app.get('/', (req, res) => {
+  res.send('🚀 API funcionando correctamente en Azure');
+});
+
+const credential = new DefaultAzureCredential(); // ✅ CAMBIO 1
 let pool;
 
 async function conectarDB() {
@@ -568,7 +573,7 @@ app.get('/api/anios', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // START
 // ═══════════════════════════════════════════════════════════════
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // ✅ CAMBIO 3
 app.listen(PORT, () => {
   console.log(`\n🚀 Servidor en http://localhost:${PORT}`);
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
