@@ -671,6 +671,39 @@ tbody tr:hover td{background:#f5f8fc;}
       <span style="font-size:12px;color:var(--muted);">¿Olvidaste tu contraseña? </span>
       <button onclick="mostrarRecuperarPass()" style="background:none;border:none;color:var(--blue);font-size:12px;cursor:pointer;text-decoration:underline;font-family:inherit;">Recuperar contraseña</button>
     </div>
+    <div style="margin-top:16px;border-top:1px solid #e9ecef;padding-top:14px;">
+      <div style="font-size:10px;font-weight:800;color:#aaa;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;text-align:center;">Accesos de demostración</div>
+      <div onclick="quickLogin('iseguras2026','ISEGURAS_2026')" style="background:white;border:1px solid #c5d5f0;border-radius:6px;margin-bottom:8px;cursor:pointer;overflow:hidden;">
+        <div style="background:#1a3a5c;padding:5px 10px;display:flex;justify-content:space-between;">
+          <span style="font-size:11px;font-weight:800;color:white;">Infraestructuras Seguras</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.7);">Administrador</span>
+        </div>
+        <div style="padding:7px 10px;display:flex;gap:16px;">
+          <span style="font-size:11px;color:#333;">Usuario: <b>iseguras2026</b></span>
+          <span style="font-size:11px;">Clave: <b style="font-family:monospace;background:#f0f4ff;padding:1px 6px;border-radius:3px;">ISEGURAS_2026</b></span>
+        </div>
+      </div>
+      <div onclick="quickLogin('operativo','oper2026')" style="background:white;border:1px solid #ffd99a;border-radius:6px;margin-bottom:8px;cursor:pointer;overflow:hidden;">
+        <div style="background:#fd7e14;padding:5px 10px;display:flex;justify-content:space-between;">
+          <span style="font-size:11px;font-weight:800;color:white;">Operativo Cliente</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.8);">Configura AC</span>
+        </div>
+        <div style="padding:7px 10px;display:flex;gap:16px;">
+          <span style="font-size:11px;color:#333;">Usuario: <b>operativo</b></span>
+          <span style="font-size:11px;">Clave: <b style="font-family:monospace;background:#fff3e0;padding:1px 6px;border-radius:3px;">oper2026</b></span>
+        </div>
+      </div>
+      <div onclick="quickLogin('colpensiones','colp2026')" style="background:white;border:1px solid #86efac;border-radius:6px;cursor:pointer;overflow:hidden;">
+        <div style="background:#28a745;padding:5px 10px;display:flex;justify-content:space-between;">
+          <span style="font-size:11px;font-weight:800;color:white;">Cliente — Colpensiones</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.8);">Evalua terceros</span>
+        </div>
+        <div style="padding:7px 10px;display:flex;gap:16px;">
+          <span style="font-size:11px;color:#333;">Usuario: <b>colpensiones</b></span>
+          <span style="font-size:11px;">Clave: <b style="font-family:monospace;background:#f0fdf4;padding:1px 6px;border-radius:3px;">colp2026</b></span>
+        </div>
+      </div>
+    </div>
     <div id="recuperar-pass-box" style="display:none;margin-top:12px;padding:12px 14px;background:#EFF6FF;border:1px solid #93C5FD;border-radius:var(--r);">
       <div style="font-size:12px;font-weight:700;color:var(--blue);margin-bottom:8px;">Recuperar contraseña</div>
       <div style="font-size:12px;color:var(--text);margin-bottom:8px;">Ingresa tu nombre de usuario y te mostraremos tu contraseña temporal.</div>
@@ -733,7 +766,72 @@ tbody tr:hover td{background:#f5f8fc;}
   </div>
 
   <div class="app-body">
-    <!-- SIDEBAR -->
+    <!-- SIDEBAR DINÁMICO según rol -->
+    <nav class="sidebar" id="sidebar-app">
+
+      <!-- ═══ SIDEBAR: CLIENTE ═══ -->
+      <div id="sb-cliente" style="display:none;">
+        <div style="margin:10px 12px 4px;padding:8px 10px;background:#e8f0f8;border-radius:6px;border:1px solid #aac8f0;">
+          <div style="font-size:9px;font-weight:800;color:#1a3a5c;text-transform:uppercase;letter-spacing:.06em;">Cliente</div>
+          <div id="sb-cliente-nombre" style="font-size:11px;color:#1a3a5c;margin-top:1px;font-weight:600;"></div>
+        </div>
+        <div class="nav-sec">Principal</div>
+        <div class="nav-item" onclick="goPage(this,'pg-dashboard')"><span class="lbl">Dashboard</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-info-general');setTimeout(function(){switchIGTab('procesos');},80)"><span class="lbl">Información General</span></div>
+        <div class="nav-sec">Clasificación</div>
+        <div class="nav-item" onclick="goPage(this,'pg-clasificacion')"><span class="lbl">Clasificación de Riesgos</span></div>
+        <div class="nav-sec">Evaluación</div>
+        <div class="nav-item" onclick="goPage(this,'pg-cuestionario')"><span class="lbl">Ambiente de Control</span></div>
+        <div class="nav-sec">Análisis de Riesgo</div>
+        <div class="nav-item" onclick="goPage(this,'pg-matriz')"><span class="lbl">Matriz de Riesgos</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-seguimiento')"><span class="lbl">Seguimiento</span></div>
+        <div class="nav-sec">Reportes</div>
+        <div class="nav-item" onclick="goPage(this,'pg-reportes')"><span class="lbl">Reportes e Informes</span></div>
+        <div class="nav-sec">Evidencias</div>
+        <div class="nav-item" onclick="goPage(this,'pg-onedrive-cliente')"><span class="lbl">Repositorio de Evidencias</span></div>
+      </div>
+
+      <!-- ═══ SIDEBAR: OPERATIVO CLIENTE ═══ -->
+      <div id="sb-operativo" style="display:none;">
+        <div style="margin:10px 12px 4px;padding:8px 10px;background:#fff3e0;border-radius:6px;border:1px solid #ffd99a;">
+          <div style="font-size:9px;font-weight:800;color:#b45309;text-transform:uppercase;letter-spacing:.06em;">Operativo Cliente</div>
+          <div style="font-size:11px;color:#92400e;margin-top:1px;">Configura el AC — el cliente diligencia</div>
+        </div>
+        <div class="nav-sec">Configurar AC</div>
+        <div class="nav-item" onclick="goPage(this,'pg-tipologias-op')"><span class="lbl">Tipologias y Escalas</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-parametrizacion')"><span class="lbl">Preguntas del AC</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-cuestionarios-op')"><span class="lbl">Cuestionarios AC</span></div>
+        <div class="nav-sec">Gestion Terceros</div>
+        <div class="nav-item" onclick="goPage(this,'pg-clasificacion')"><span class="lbl">Registrar Tercero</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-terceros-op')"><span class="lbl">Aprobar para Evaluacion</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-tipologias')"><span class="lbl">Tipologias de Riesgo</span></div>
+        <div class="nav-sec">Supervisar Evaluacion</div>
+        <div class="nav-item" onclick="goPage(this,'pg-cuestionario')"><span class="lbl">Ambiente de Control</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-evaluaciones')"><span class="lbl">Evaluaciones AC</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-matriz')"><span class="lbl">Matriz de Riesgos</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-seguimiento')"><span class="lbl">Seguimiento</span></div>
+        <div class="nav-sec">Reportes</div>
+        <div class="nav-item" onclick="goPage(this,'pg-reportes')"><span class="lbl">Reportes</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-reportes-clientes')"><span class="lbl">Reportes de Clientes</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-aprobacion')"><span class="lbl">Aprobacion Terceros</span></div>
+      </div>
+
+      <!-- ═══ SIDEBAR: ADMIN IS ═══ -->
+      <div id="sb-admin" style="display:none;">
+        <div style="margin:10px 12px 4px;padding:8px 10px;background:linear-gradient(135deg,#0d2740,#1a3a5c);border-radius:6px;">
+          <div style="font-size:9px;font-weight:800;color:rgba(255,255,255,.6);text-transform:uppercase;letter-spacing:.06em;">Infraestructuras Seguras</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.85);margin-top:1px;">Instala · Configura · Administra</div>
+        </div>
+        <div class="nav-sec">Sistema</div>
+        <div class="nav-item" onclick="goPage(this,'pg-dashboard')"><span class="lbl">Dashboard</span></div>
+        <div class="nav-sec">Instalacion y Acceso</div>
+        <div class="nav-item" onclick="goPage(this,'pg-usuarios')"><span class="lbl">Usuarios y Roles</span></div>
+        <div class="nav-item" onclick="goPage(this,'pg-info-general')"><span class="lbl">Entidades / Clientes</span></div>
+        <div class="nav-sec">Auditoria</div>
+        <div class="nav-item" onclick="goPage(this,'pg-logs')"><span class="lbl">Logs de Auditoria</span></div>
+      </div>
+
+    </nav>
     <nav class="sidebar">
       <div class="nav-sec">Principal</div>
       <div class="nav-item" onclick="goPage(this,&#39;pg-dashboard&#39;)"><span class="lbl">Dashboard</span></div>
@@ -747,9 +845,6 @@ tbody tr:hover td{background:#f5f8fc;}
       <div class="nav-item" onclick="goPage(this,&#39;pg-seguimiento&#39;)"><span class="lbl">Seguimiento</span></div>
       <div class="nav-item" onclick="goPage(this,&#39;pg-reportes&#39;)"><span class="lbl">Reportes e Informes</span></div>
       <div class="nav-sec" style="display: none;">Sistema</div>
-      <div class="nav-item" onclick="goPage(this,&#39;pg-usuarios&#39;)" style="display: none;"><span class="lbl">Usuarios</span></div>
-      <div class="nav-item" onclick="goPage(this,&#39;pg-logs&#39;)" style="display: none;"><span class="lbl">Logs de Auditoría</span></div>
-      <div class="nav-item admin-only" onclick="goPage(this,&#39;pg-evidencias&#39;)" style="display: none;"><span class="ico">📌</span><span class="lbl">Evidencias</span></div>
     </nav>
 
     <!-- MAIN -->
@@ -1467,7 +1562,7 @@ tbody tr:hover td{background:#f5f8fc;}
               <div class="field ffull"><label>Servicio Contratado <span class="req">*</span></label><input type="text" id="cf-servicio" placeholder="Descripción del servicio contratado"></div>
               <div class="field ffull"><label>Objetivo del contrato</label><textarea id="cf-objetivo" rows="2" placeholder="Objetivo del contrato..."></textarea></div>
               <div class="field"><label>Fecha de Inicio del Contrato</label><input type="date" id="cf-finicio" onchange="calcDuracionDisplay()"></div>
-              <div class="field"><label>Fecha de Terminación del Contrato</label><input type="date" id="cf-fterm" onchange="calcDuracionDisplay()"></div>
+              <div class="field"><label>Estado del Contrato</label><input type="text" id="cf-fterm" value="En Ejecución" style="background:#f0fdf4;font-weight:700;color:#166534;" readonly></div>
               <div class="field"><label>Valor del contrato</label><input type="text" id="cf-valor" placeholder="Ej: 11.000.000.000" oninput="formatValorContrato(this)" inputmode="numeric" style="font-weight:600;"></div>
               <div class="field">
                 <label>Duración del contrato <span style="font-size:10px;color:var(--muted);font-weight:400;">(auto)</span></label>
@@ -1475,12 +1570,14 @@ tbody tr:hover td{background:#f5f8fc;}
                 <div id="cf-duracion-badge" style="display:none;align-items:center;gap:6px;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:600;margin-top:4px;"></div>
               </div>
               <div class="field"><label>Domicilio <span class="req">*</span></label><input type="text" id="cf-domicilio" placeholder="Ciudad, Dirección"></div>
+              <div class="field"><label>Correo de contacto <span class="req">*</span></label><input type="email" id="cf-correo" placeholder="contacto@empresa.co" required></div>
+              <div class="field ffull"><label>Alcance de la supervisión</label><textarea id="cf-alcance" rows="2" placeholder="Describe el alcance y los límites de la supervisión..."></textarea></div>
               <div class="field"><label>Nombre del Supervisor <span class="req">*</span></label><div style="display:flex;gap:5px;"><input type="text" id="cf-supervisor" placeholder="Nombre completo del supervisor" style="flex:1;"><button type="button" onclick="lupaAbrirSupervisor()" style="padding:8px 10px;background:#EFF6FF;border:1px solid #93C5FD;border-radius:var(--r);cursor:pointer;font-size:14px;flex-shrink:0;">🔍</button></div></div>
               <div class="field"><label>Cargo del Supervisor</label><input type="text" id="cf-cargo" placeholder="Ej: Gerente de Riesgos"></div>
               <div class="field"><label>Proceso encargado de la supervisión</label><div style="display:flex;gap:5px;"><input type="text" id="cf-proceso-supervision" placeholder="Ej: Control Interno, Gestión de Riesgos" style="flex:1;"><button type="button" onclick="lupaAbrirProceso()" style="padding:8px 10px;background:#EFF6FF;border:1px solid #93C5FD;border-radius:var(--r);cursor:pointer;font-size:14px;flex-shrink:0;">🔍</button></div></div>
-              <div class="field"><label>Supervisor Secundario</label><input type="text" id="cf-supervisor2" placeholder="Nombre del supervisor secundario (opcional)"></div>
+              <div class="field"><label>Supervisor del Tercero (Alterno)</label><input type="text" id="cf-supervisor2" placeholder="Nombre del supervisor alterno (opcional)"></div>
               <div class="field ffull"><label>Procesos que soporta el contrato</label><textarea id="cf-procesos-soporta" rows="2" placeholder="Ej: P-01 Gestión Comercial, P-03 Seguimiento y Monitoreo, P-05 Nómina..."></textarea></div>
-              <div class="field ffull"><label>Observaciones del contrato</label><textarea id="cf-observaciones" rows="2" placeholder="Observaciones adicionales sobre el contrato o la relación con el tercero..."></textarea></div>
+              <div class="field ffull"><label>Periodicidad de supervisión</label><select id="cf-periodicidad-obs" style="width:100%;padding:7px 10px;border:1px solid var(--border2);border-radius:var(--r);font-size:12.5px;font-family:inherit;margin-bottom:8px;"><option value="">— Seleccionar periodicidad —</option><option value="Mensual">Mensual</option><option value="Trimestral">Trimestral</option><option value="Semestral">Semestral</option><option value="Anual">Anual</option><option value="Según requerimiento">Según requerimiento</option></select><label style="font-size:11px;color:var(--muted);">Observaciones del alcance</label><textarea id="cf-observaciones" rows="2" placeholder="Observaciones sobre el alcance y supervisión del tercero..."></textarea></div>
             </div>
 
             <!-- Alerta siguiente paso (aparece si promedio >= 3) -->
@@ -1495,7 +1592,17 @@ tbody tr:hover td{background:#f5f8fc;}
 
             <div style="display:flex;justify-content:flex-end;gap:8px;padding-top:14px;border-top:1px solid var(--border);">
               <button class="btn btn-outline" onclick="resetClasifForm()">Limpiar</button>
-              <button class="btn btn-success" style="font-size:13px;padding:10px 24px;font-weight:700;" onclick="saveClasifForm()">Guardar Registro</button>
+              <button class="btn btn-success" style="font-size:13px;padding:10px 24px;font-weight:700;" onclick="saveClasifFormYHabilitar()">Guardar Registro</button>
+            </div>
+            <!-- Botón Evaluar: aparece solo con prom >= 3 -->
+            <div id="cls-evaluar-wrap" style="display:none;margin-top:10px;">
+              <div style="background:#e8f8f2;border:1px solid #82d9ae;border-radius:var(--r);padding:10px 14px;display:flex;align-items:center;gap:10px;justify-content:space-between;">
+                <div>
+                  <div style="font-size:12.5px;font-weight:700;color:#1e6449;">Registro guardado. Ahora si puede evaluar.</div>
+                  <div style="font-size:11px;color:#1e6449;margin-top:2px;">El tercero requiere Ambiente de Control y Matriz de Riesgos.</div>
+                </div>
+                <button class="btn btn-success" style="font-size:13px;padding:9px 20px;font-weight:700;" onclick="irAEvaluar()">Evaluar</button>
+              </div>
             </div>
           </div>
         </div>
@@ -1567,7 +1674,6 @@ tbody tr:hover td{background:#f5f8fc;}
               <option value="cu">Regulación-Cumplimiento (Riesgo Cumplimiento)</option>
               <option value="fr">Fraude y/o corrupción (Riesgo Fraude y Corrupción)</option>
               <option value="laft">Lavado de Activos y Financiación al Terrorismo (LAFT)</option>
-              <option value="custom">Otra tipología personalizada...</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="agregarTipologiaSeleccionada()">Agregar</button>
             <button id="btn-ver-desc-tip" class="btn btn-outline btn-sm" onclick="toggleDescTipologia()" style="display:none;">Ver descripcion</button>
@@ -4128,7 +4234,7 @@ tbody tr:hover td{background:#f5f8fc;}
         <div class="field"><label>Nombre del Supervisor</label><input type="text" id="igc-supervisor" placeholder="Nombre completo"></div>
         <div class="field"><label>Cargo del Supervisor</label><input type="text" id="igc-cargo" placeholder="Ej: Gerente de Riesgos"></div>
         <div class="field"><label>Proceso de Supervisión</label><input type="text" id="igc-proceso-sup" placeholder="Ej: Control Interno"></div>
-        <div class="field"><label>Supervisor Secundario</label><input type="text" id="igc-supervisor2" placeholder="Nombre opcional"></div>
+        <div class="field"><label>Supervisor del Tercero (Alterno)</label><input type="text" id="igc-supervisor2" placeholder="Nombre opcional"></div>
         <div class="field"><label>Domicilio</label><input type="text" id="igc-domicilio" placeholder="Ciudad, Dirección"></div>
         <div class="field"><label>Valor del Contrato</label><input type="text" id="igc-valor" placeholder="Ej: 11.000.000.000"></div>
         <div class="field"><label>Fecha de Inicio</label><input type="date" id="igc-finicio"></div>
@@ -5377,6 +5483,37 @@ document.addEventListener('scroll', _closeMenu, true);
 <!-- ═══════════════ ADMIN APP ═══════════════ -->
 
 </div>
+
+
+        <!-- Páginas Operativo Cliente -->
+        <div id="pg-tipologias-op" class="page"></div>
+        <div id="pg-parametrizacion" class="page"></div>
+        <div id="pg-terceros-op" class="page"></div>
+
+        <!-- Repositorio Evidencias Cliente -->
+        <div id="pg-onedrive-cliente" class="page">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+            <div>
+              <h2 style="font-family:'Montserrat',sans-serif;font-size:18px;font-weight:800;color:var(--navy);">Repositorio de Evidencias</h2>
+              <div style="font-size:12px;color:var(--muted);">Sube y organiza documentos por carpeta</div>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <button onclick="odNuevaCarpeta()" style="padding:7px 14px;background:white;border:1px solid var(--border2);border-radius:var(--r);font-size:12px;font-weight:600;cursor:pointer;">+ Carpeta</button>
+              <label style="padding:7px 14px;background:var(--blue);color:white;border-radius:var(--r);font-size:12px;font-weight:700;cursor:pointer;">Subir archivo<input type="file" multiple style="display:none;" onchange="odSubirArchivos(this.files)"></label>
+            </div>
+          </div>
+          <div id="od-breadcrumb" style="margin-bottom:12px;font-size:12.5px;"></div>
+          <div id="od-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:12px;min-height:180px;"></div>
+          <div style="margin-top:16px;border:2px dashed var(--border2);border-radius:var(--r2);padding:28px;text-align:center;color:var(--muted);cursor:pointer;"
+            ondragover="event.preventDefault();this.style.borderColor='var(--blue)';"
+            ondragleave="this.style.borderColor='var(--border2)';"
+            ondrop="event.preventDefault();this.style.borderColor='var(--border2)';odSubirArchivos(event.dataTransfer.files);"
+            onclick="this.querySelector('input').click()">
+            <input type="file" multiple style="display:none;" onchange="odSubirArchivos(this.files)">
+            <div style="font-size:32px;margin-bottom:8px;">+</div>
+            <div style="font-weight:600;font-size:13px;">Arrastra archivos aqui o haz clic</div>
+          </div>
+        </div>
 
 <div id="admin-app">
 
@@ -10337,13 +10474,13 @@ function initClasificacion(){
 }
 
 
-const USERS = {
-  'admin':       {pass:'admin123',   name:'Admin General',    rol:'Administrador', initials:'AD', entidad:null},
-  'carolina':    {pass:'carol2026',  name:'Carolina V.',      rol:'Administrador', initials:'CV', entidad:null},
-  'andres':      {pass:'andres2026', name:'Andrés M.',        rol:'Analista',      initials:'AM', entidad:null},
-  'luis':        {pass:'luis2026',   name:'Luis T.',          rol:'Auditor',       initials:'LT', entidad:null},
-  'colpensiones':{pass:'colp2026',   name:'Colpensiones',     rol:'Cliente',       initials:'CP', entidad:'colpensiones'},
-  'ecopetrol':   {pass:'ecop2026',   name:'Ecopetrol',        rol:'Cliente',       initials:'EC', entidad:'ecopetrol'},
+var USERS = {
+  'admin':       {pass:'admin123',   name:'Admin General',            rol:'Administrador',     initials:'AD', entidad:null},
+  'iseguras2026':{pass:'ISEGURAS_2026', name:'Infraestructuras Seguras', rol:'Administrador',     initials:'IS', entidad:null},
+  'carolina':    {pass:'carol2026',  name:'Carolina V.',              rol:'Administrador',     initials:'CV', entidad:null},
+  'operativo':   {pass:'oper2026',   name:'Operativo Demo',           rol:'Operativo Cliente', initials:'OP', entidad:'colpensiones'},
+  'colpensiones':{pass:'colp2026',   name:'Colpensiones',             rol:'Cliente',           initials:'CP', entidad:'colpensiones'},
+  'ecopetrol':   {pass:'ecop2026',   name:'Ecopetrol',                rol:'Cliente',           initials:'EC', entidad:'ecopetrol'},
 };
 let currentUser = null;
 
@@ -17751,4 +17888,634 @@ function initAdminDashboard(){
   s('admin-kpi-terceros',terceros); s('admin-kpi-extremos',extremos);
   s('admin-kpi-riesgos',riesgos); s('admin-kpi-entidades',entidades);
 }
+</script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// PERSISTENCIA GLOBAL — _lsSave / _lsLoad
+// ═══════════════════════════════════════════════════════════════
+var _LS_KEY = 'sgrt_app_v3';
+
+window._lsSave = function(){
+  try {
+    var data = {
+      TERCEROS_DB:         window.TERCEROS_DB         || {},
+      TIPOLOGIAS_DB:       window.TIPOLOGIAS_DB        || {},
+      TIPOLOGIA_CATALOG:   window.TIPOLOGIA_CATALOG    || {},
+      CUEST_RESPUESTAS:    window.CUEST_RESPUESTAS     || {},
+      RESULTADO_EVALUACION:window.RESULTADO_EVALUACION || {},
+      LOGS_DATA:           (window.LOGS_DATA||[]).slice(0,300),
+      TIP_NIVELES:         window.TIP_NIVELES          || {},
+      USERS_CUSTOM:        window.USERS_CUSTOM         || {},
+      ENTIDADES_EXTRA:     window.ENTIDADES_EXTRA       || [],
+    };
+    localStorage.setItem(_LS_KEY, JSON.stringify(data));
+  } catch(e){ console.warn('_lsSave error:', e); }
+};
+
+window._lsLoad = function(){
+  try {
+    var raw = localStorage.getItem(_LS_KEY);
+    if(!raw) return;
+    var data = JSON.parse(raw);
+    if(data.TERCEROS_DB         && Object.keys(data.TERCEROS_DB).length)  window.TERCEROS_DB         = data.TERCEROS_DB;
+    if(data.TIPOLOGIAS_DB       && Object.keys(data.TIPOLOGIAS_DB).length) window.TIPOLOGIAS_DB       = data.TIPOLOGIAS_DB;
+    if(data.TIPOLOGIA_CATALOG   && Object.keys(data.TIPOLOGIA_CATALOG).length) window.TIPOLOGIA_CATALOG = data.TIPOLOGIA_CATALOG;
+    if(data.CUEST_RESPUESTAS)    window.CUEST_RESPUESTAS    = data.CUEST_RESPUESTAS;
+    if(data.RESULTADO_EVALUACION)window.RESULTADO_EVALUACION= data.RESULTADO_EVALUACION;
+    if(data.LOGS_DATA && data.LOGS_DATA.length) window.LOGS_DATA = data.LOGS_DATA;
+    if(data.TIP_NIVELES)         window.TIP_NIVELES         = data.TIP_NIVELES;
+    if(data.USERS_CUSTOM)        window.USERS_CUSTOM        = data.USERS_CUSTOM;
+    if(data.ENTIDADES_EXTRA)     window.ENTIDADES_EXTRA     = data.ENTIDADES_EXTRA;
+    // Merge custom users
+    if(window.USERS_CUSTOM) Object.assign(window.USERS || {}, window.USERS_CUSTOM);
+    // Merge custom tipologías al catálogo
+    if(window.TIPOLOGIA_CATALOG) {
+      Object.entries(window.TIPOLOGIA_CATALOG).forEach(function(e){
+        var key = e[0], cat = e[1];
+        if(key.startsWith('custom_')) {
+          var sel = document.getElementById('cf-tip-selector');
+          if(sel && !sel.querySelector('option[value="'+key+'"]')){
+            var opt = document.createElement('option');
+            opt.value = key; opt.textContent = cat.nombre || key;
+            sel.appendChild(opt);
+          }
+        }
+      });
+    }
+  } catch(e){ console.warn('_lsLoad error:', e); }
+};
+
+// Auto-guardar en cada saveClasifForm
+(function(){
+  var _orig = window.saveClasifForm;
+  if(typeof _orig === 'function'){
+    window.saveClasifForm = function(){
+      var result = _orig.apply(this, arguments);
+      setTimeout(window._lsSave, 800);
+      return result;
+    };
+  }
+})();
+
+// Auto-guardar en guardarTipologia
+(function(){
+  var _orig = window.guardarTipologia;
+  if(typeof _orig === 'function'){
+    window.guardarTipologia = function(){
+      _orig.apply(this, arguments);
+      setTimeout(window._lsSave, 300);
+      // Refrescar panel tipologias del operativo
+      setTimeout(function(){
+        if(typeof window.renderTipologiasOp==='function') window.renderTipologiasOp();
+      }, 400);
+    };
+  }
+})();
+
+// Iniciar al cargar: si hay datos guardados, restaurarlos
+document.addEventListener('DOMContentLoaded', function(){
+  window._lsLoad();
+  console.log('Datos restaurados desde localStorage');
+});
+
+// ═══════════════════════════════════════════════════════════════
+// TIPOLOGÍAS SELECCIONADAS EN CLASIFICACIÓN → AC Y MATRIZ
+// ═══════════════════════════════════════════════════════════════
+
+// Devuelve las tipologías que el tercero seleccionó en clasificación
+window.getTipologiasDelTercero = function(nit) {
+  var db = window.TERCEROS_DB || {};
+  var t  = db[nit];
+  if(!t || !t.dims || !t.dims.length) return [];
+  return t.dims.map(function(d){ return d.nombre || d.key || ''; }).filter(Boolean);
+};
+
+// Poblar selector de tipologías en MATRIZ con solo las del tercero
+window.poblarTipologiasMatriz = function(selectId, nit) {
+  var sel = document.getElementById(selectId);
+  if(!sel) return;
+  sel.innerHTML = '<option value="">— Seleccionar tipología —</option>';
+  var tips = window.getTipologiasDelTercero(nit);
+  if(!tips.length) {
+    sel.innerHTML = '<option value="">Sin tipologías (complete clasificación primero)</option>';
+    return;
+  }
+  tips.forEach(function(tip){
+    var opt = document.createElement('option');
+    opt.value = tip; opt.textContent = tip;
+    sel.appendChild(opt);
+  });
+};
+
+// Override onNrTerceroChange para poblar tipologías desde dims
+(function(){
+  var _orig = window.onNrTerceroChange;
+  window.onNrTerceroChange = function(nit) {
+    if(_orig) _orig(nit);
+    window.poblarTipologiasMatriz('nr-tipo', nit);
+    var hint = document.getElementById('nr-tipo-hint');
+    if(hint) {
+      var tips = window.getTipologiasDelTercero(nit);
+      hint.textContent = tips.length ? tips.length+' tipología(s) de la clasificación' : 'Complete clasificación primero';
+    }
+  };
+})();
+
+// Override onMrTerceroChange (modal matriz)
+(function(){
+  var _orig = window.onMrTerceroChange;
+  window.onMrTerceroChange = function(nit) {
+    if(_orig) _orig(nit);
+    window.poblarTipologiasMatriz('mr-tipo', nit);
+  };
+})();
+
+// Sincronizar cuestionario AC: solo tipologías del tercero
+(function(){
+  var _orig = window.sincronizarSelectorCuestionario;
+  window.sincronizarSelectorCuestionario = function() {
+    if(_orig) _orig();
+    // Actualizar hint en selector del cuestionario
+    var selQ = document.getElementById('q-tercero');
+    if(selQ && selQ.value) {
+      var tips = window.getTipologiasDelTercero(selQ.value);
+      var hintAC = document.getElementById('q-tips-hint');
+      if(hintAC) hintAC.textContent = tips.length ? 'Tipologías: '+tips.join(', ') : '';
+    }
+  };
+})();
+
+// ═══════════════════════════════════════════════════════════════
+// ONEDRIVE GLOBAL — disponible para los 3 roles
+// ═══════════════════════════════════════════════════════════════
+// (La lógica od* ya está al final del fix, se llama desde goPage)
+
+// ═══════════════════════════════════════════════════════════════
+// REPORTES E INFORMES — página pg-reportes mejorada
+// ═══════════════════════════════════════════════════════════════
+window.renderReportesCompleto = function() {
+  var pg = document.getElementById('pg-reportes');
+  if(!pg) return;
+
+  var db   = window.TERCEROS_DB || {};
+  var rows = Object.values(db);
+
+  // Filtro por entidad del usuario
+  var user = window.currentUser;
+  if(user && user.rol === 'Cliente' && user.entidad) {
+    rows = rows.filter(function(t){ return t.entidad === user.entidad; });
+  }
+
+  // KPIs
+  var total    = rows.length;
+  var criticos = rows.filter(function(t){ return parseFloat(t.prom||0) >= 4; }).length;
+  var conAC    = rows.filter(function(t){
+    var cr = (window.CUEST_RESPUESTAS||{})[t.nit];
+    return cr && Object.keys(cr).length > 0;
+  }).length;
+  var sinAC    = rows.filter(function(t){ return parseFloat(t.prom||0) >= 3; }).length - conAC;
+
+  var h = '';
+  h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">';
+  h += '<div><h2 style="font-family:Montserrat,sans-serif;font-size:18px;font-weight:800;color:#1a3a5c;margin:0;">Reportes e Informes</h2>';
+  h += '<div style="font-size:12px;color:#6c757d;margin-top:2px;">Clasificacion · Ambiente de Control · Matriz de Riesgos — por entidad y tipologia</div></div>';
+  h += '<button onclick="exportarReporteCSV()" style="padding:7px 16px;background:white;border:1px solid #dee2e6;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">Exportar CSV</button>';
+  h += '</div>';
+
+  // KPIs
+  h += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;">';
+  [{label:'Total Terceros',val:total,color:'#1e6bb8'},{label:'Criticos (≥4)',val:criticos,color:'#dc3545'},
+   {label:'Con AC',val:conAC,color:'#28a745'},{label:'AC Pendiente',val:sinAC<0?0:sinAC,color:'#fd7e14'}].forEach(function(k){
+    h += '<div style="background:white;border:1px solid #dee2e6;border-radius:8px;padding:14px;border-left:4px solid '+k.color+';display:flex;align-items:center;gap:12px;">';
+    h += '<div><div style="font-size:10px;color:#aaa;font-weight:700;text-transform:uppercase;margin-bottom:4px;">'+k.label+'</div>';
+    h += '<div style="font-size:26px;font-weight:800;color:'+k.color+';font-family:Montserrat,sans-serif;">'+k.val+'</div></div></div>';
+  });
+  h += '</div>';
+
+  // Tabla
+  h += '<div style="background:white;border:1px solid #dee2e6;border-radius:8px;overflow:hidden;">';
+  h += '<table style="width:100%;border-collapse:collapse;">';
+  h += '<thead><tr style="background:#1a3a5c;">';
+  ['Tercero / NIT','Entidad','Tipologias','Clasif.','Zona','Period.','AC %','Riesgos','Estado'].forEach(function(col){
+    h += '<th style="padding:10px 12px;font-size:11px;font-weight:700;color:white;text-align:left;white-space:nowrap;">'+col+'</th>';
+  });
+  h += '</tr></thead><tbody>';
+
+  if(!rows.length){
+    h += '<tr><td colspan="9" style="text-align:center;padding:30px;color:#aaa;">Sin datos. Registra terceros en Clasificacion de Riesgos.</td></tr>';
+  } else {
+    var zc = {'EXTREMO/ALTO':'#dc3545','ALTO/MEDIO':'#fd7e14','BAJO':'#28a745'};
+    rows.forEach(function(t, i){
+      var nit  = t.nit||'';
+      var tips = (t.dims||[]).map(function(d){return (d.nombre||d.key||'').replace('Riesgo ','').slice(0,15);}).join(', ');
+      var prom = parseFloat(t.prom||0);
+      var cr   = (window.CUEST_RESPUESTAS||{})[nit]||{};
+      var acTips= Object.keys(cr).length;
+      var acPct = '—';
+      if(acTips > 0){
+        var tot=0,resp=0;
+        Object.values(cr).forEach(function(tipR){ Object.values(tipR).forEach(function(ctrl){ if(ctrl&&typeof ctrl==='object'){tot++;if(ctrl.val&&ctrl.val>0)resp++;} }); });
+        acPct = tot>0 ? Math.round(resp/tot*100)+'%' : '0%';
+      }
+      var numR = (window.MATRIZ_DB||[]).filter(function(r){ return r.tercero===nit||r.tercero===t.nombre; }).length;
+      var etapas = (prom>0?1:0)+(acTips>0?1:0)+(numR>0?1:0);
+      var estadoLbl = ['Sin iniciar','En proceso','Avanzado','Completo'][etapas]||'—';
+      var estadoCol = ['#aaa','#ffc107','#fd7e14','#28a745'][etapas]||'#aaa';
+      h += '<tr style="border-bottom:1px solid #dee2e6;background:'+(i%2?'#f8f9fa':'white')+'">';
+      h += '<td style="padding:10px 12px;"><div style="font-weight:700;color:#1a3a5c;font-size:13px;">'+(t.nombre||'—')+'</div><div style="font-size:10.5px;color:#aaa;">'+nit+'</div></td>';
+      h += '<td style="padding:10px 12px;font-size:12px;color:#6c757d;">'+(t.entidad||'—')+'</td>';
+      h += '<td style="padding:10px 12px;font-size:11px;color:#6c757d;max-width:160px;">'+( tips||'—')+'</td>';
+      h += '<td style="padding:10px 12px;text-align:center;font-weight:800;font-size:15px;color:#1a3a5c;">'+(prom>0?prom.toFixed(1):'—')+'</td>';
+      h += '<td style="padding:10px 12px;"><span style="padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:white;background:'+(zc[t.zona]||'#aaa')+';white-space:nowrap;">'+(t.zona||'—')+'</span></td>';
+      h += '<td style="padding:10px 12px;font-size:11px;color:#6c757d;white-space:nowrap;">'+(t.periodicidad||'—')+'</td>';
+      h += '<td style="padding:10px 12px;text-align:center;font-weight:700;color:'+(acPct==='—'?'#aaa':parseInt(acPct)>=70?'#28a745':parseInt(acPct)>=40?'#fd7e14':'#dc3545')+';">'+acPct+'</td>';
+      h += '<td style="padding:10px 12px;text-align:center;font-weight:800;color:'+(numR?'#fd7e14':'#aaa')+';">'+numR+'</td>';
+      h += '<td style="padding:10px 12px;"><span style="padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:white;background:'+estadoCol+';">'+estadoLbl+'</span></td>';
+      h += '</tr>';
+    });
+  }
+  h += '</tbody></table></div>';
+
+  // Panel OneDrive en reportes
+  h += '<div style="margin-top:20px;background:white;border:1px solid #dee2e6;border-radius:8px;overflow:hidden;">';
+  h += '<div style="padding:12px 16px;border-bottom:1px solid #dee2e6;background:#f8f9fa;display:flex;justify-content:space-between;align-items:center;">';
+  h += '<b style="font-size:14px;color:#1a3a5c;">Repositorio de Evidencias</b>';
+  h += '<div style="display:flex;gap:8px;">';
+  h += '<button onclick="odNuevaCarpeta()" style="padding:5px 12px;background:white;border:1px solid #dee2e6;border-radius:5px;font-size:11.5px;font-weight:600;cursor:pointer;">+ Carpeta</button>';
+  h += '<label style="padding:5px 12px;background:#1e6bb8;color:white;border-radius:5px;font-size:11.5px;font-weight:700;cursor:pointer;">Subir<input type="file" multiple style="display:none;" onchange="odSubirArchivos(this.files)"></label>';
+  h += '</div></div>';
+  h += '<div id="od-breadcrumb-rpt" style="padding:6px 16px;font-size:12px;border-bottom:1px solid #eee;"></div>';
+  h += '<div id="od-grid-rpt" style="padding:14px 16px;display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;min-height:120px;"></div>';
+  h += '</div>';
+
+  pg.innerHTML = h;
+
+  // Iniciar OneDrive en sección reportes
+  setTimeout(function(){
+    if(typeof window.odInit==='function'){
+      window._odGridId = 'od-grid-rpt';
+      window._odBcId   = 'od-breadcrumb-rpt';
+      window.odRenderCustom();
+    }
+  }, 100);
+};
+
+// OneDrive con IDs configurables
+window.odRenderCustom = function(){
+  var gridId = window._odGridId || 'od-grid';
+  var bcId   = window._odBcId   || 'od-breadcrumb';
+  var folder = window.odCurrentFolder ? window.odCurrentFolder() : null;
+  if(!folder) return;
+  var grid=document.getElementById(gridId), bc=document.getElementById(bcId);
+  if(!grid||!bc) return;
+  var bHtml='<span onclick="window.odNavTo(-1);window.odRenderCustom()" style="cursor:pointer;color:#1e6bb8;font-weight:700;">Inicio</span>';
+  (window.odPath||[]).forEach(function(step,i){bHtml+=' / <span onclick="window.odNavTo('+i+');window.odRenderCustom()" style="cursor:pointer;color:#1e6bb8;">'+step.name+'</span>';});
+  bc.innerHTML=bHtml;
+  var kids=folder.children||[];
+  if(!kids.length){grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:20px;color:#aaa;"><div style="font-size:28px;margin-bottom:6px;">+</div><div>Carpeta vacia</div></div>';return;}
+  var icons={folder:'[DIR]',pdf:'[PDF]',doc:'[DOC]',docx:'[DOC]',xls:'[XLS]',xlsx:'[XLS]',png:'[IMG]',jpg:'[IMG]',jpeg:'[IMG]'};
+  grid.innerHTML=kids.map(function(item){
+    var ext=item.type==='folder'?'folder':(item.name.split('.').pop()||'').toLowerCase();
+    var color=item.type==='folder'?'#ffc107':'#1e6bb8';
+    var lbl=icons[ext]||'[FILE]';
+    var meta=item.fecha?'<div style="font-size:10px;color:#aaa;margin-top:2px;">'+item.fecha+'</div>':'';
+    return '<div onclick="window.odClick(''+item.id+'');window.odRenderCustom()" style="background:white;border:1px solid #dee2e6;border-radius:8px;padding:12px 8px;text-align:center;cursor:pointer;position:relative;" onmouseover="this.style.borderColor='#1e6bb8'" onmouseout="this.style.borderColor='#dee2e6'">'
+      +'<div style="font-size:22px;color:'+color+';margin-bottom:4px;font-weight:800;font-family:monospace;">'+lbl+'</div>'
+      +'<div style="font-size:11px;font-weight:600;color:#222;word-break:break-word;">'+item.name+'</div>'+meta
+      +'<button onclick="event.stopPropagation();window.odEliminar(''+item.id+'');window.odRenderCustom()" style="position:absolute;top:3px;right:3px;background:none;border:none;color:#ccc;font-size:12px;cursor:pointer;padding:1px 4px;">x</button>'
+      +'</div>';
+  }).join('');
+};
+
+// exportarReporteCSV
+window.exportarReporteCSV = function(){
+  var db   = window.TERCEROS_DB || {};
+  var rows = Object.values(db);
+  if(!rows.length){ try{showToast('Sin datos para exportar','error',2000);}catch(e){} return; }
+  var lines = ['NIT,Nombre,Entidad,Tipologias,Promedio,Zona,Periodicidad,AC%,Riesgos'];
+  rows.forEach(function(t){
+    var tips=(t.dims||[]).map(function(d){return d.nombre||d.key||'';}).join(' | ');
+    var cr=(window.CUEST_RESPUESTAS||{})[t.nit]||{};
+    var tot=0,resp=0;
+    Object.values(cr).forEach(function(tr){ Object.values(tr).forEach(function(ctrl){ if(ctrl&&typeof ctrl==='object'){tot++;if(ctrl.val&&ctrl.val>0)resp++;} }); });
+    var acPct=tot>0?Math.round(resp/tot*100)+'%':'—';
+    var numR=(window.MATRIZ_DB||[]).filter(function(r){return r.tercero===t.nit||r.tercero===t.nombre;}).length;
+    lines.push([t.nit,'"'+(t.nombre||'')+'"',t.entidad||'','"'+tips+'"',
+      parseFloat(t.prom||0).toFixed(2),t.zona||'',t.periodicidad||'',acPct,numR].join(','));
+  });
+  var blob=new Blob([lines.join('\n')],{type:'text/csv;charset=utf-8;'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');a.href=url;a.download='reporte_'+new Date().toISOString().slice(0,10)+'.csv';a.click();URL.revokeObjectURL(url);
+  try{showToast('CSV exportado','success',2500);}catch(e){}
+};
+
+// ═══════════════════════════════════════════════════════════════
+// FIX FINAL — carga al final, sobreescribe funciones clave
+// ═══════════════════════════════════════════════════════════════
+window.currentUser = window.currentUser || null;
+
+// USERS con 3 roles
+window.USERS = {
+  'admin':       {pass:'admin123',   name:'Admin General',            rol:'Administrador',     initials:'AD', entidad:null},
+  'iseguras2026':{pass:'ISEGURAS_2026', name:'Infraestructuras Seguras', rol:'Administrador',     initials:'IS', entidad:null},
+  'carolina':    {pass:'carol2026',  name:'Carolina V.',              rol:'Administrador',     initials:'CV', entidad:null},
+  'operativo':   {pass:'oper2026',   name:'Operativo Demo',           rol:'Operativo Cliente', initials:'OP', entidad:'colpensiones'},
+  'colpensiones':{pass:'colp2026',   name:'Colpensiones',             rol:'Cliente',           initials:'CP', entidad:'colpensiones'},
+  'ecopetrol':   {pass:'ecop2026',   name:'Ecopetrol',                rol:'Cliente',           initials:'EC', entidad:'ecopetrol'},
+};
+
+window.quickLogin = function(u, p) {
+  var uEl=document.getElementById('li-user'), pEl=document.getElementById('li-pass');
+  if(uEl) uEl.value=u; if(pEl) pEl.value=p;
+  window.doLogin();
+};
+
+// Mostrar sidebar correcto según rol
+window.mostrarSidebar = function(rol) {
+  ['sb-cliente','sb-operativo','sb-admin'].forEach(function(id){
+    var el=document.getElementById(id); if(el) el.style.display='none';
+  });
+  var target = rol==='Operativo Cliente' ? 'sb-operativo' : (rol==='Administrador'||rol==='Analista'||rol==='Auditor') ? 'sb-admin' : 'sb-cliente';
+  var el = document.getElementById(target); if(el) el.style.display='block';
+  // Activar primer item
+  var nav = document.getElementById('sidebar-app');
+  if(nav) {
+    nav.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active');});
+    var first = nav.querySelector('#'+target+' .nav-item');
+    if(first) first.classList.add('active');
+  }
+};
+
+window.doLogin = function() {
+  var u=(document.getElementById('li-user').value||'').trim().toLowerCase();
+  var pw=document.getElementById('li-pass').value||'';
+  var err=document.getElementById('login-err');
+
+  if(!window.USERS[u]||window.USERS[u].pass!==pw){
+    if(err){err.style.display='block';err.textContent='Usuario o contraseña incorrectos';}
+    document.getElementById('li-pass').value=''; return;
+  }
+  if(err) err.style.display='none';
+  window.currentUser=window.USERS[u];
+  var user=window.currentUser;
+  document.getElementById('login-screen').style.display='none';
+
+  var isAdmin=user.rol==='Administrador'||user.rol==='Analista'||user.rol==='Auditor';
+
+  if(isAdmin) {
+    // App Admin IS
+    var clienteApp=document.getElementById('cliente-app');
+    if(clienteApp) clienteApp.style.display='none';
+    var adminEl=document.getElementById('admin-app');
+    if(adminEl){
+      adminEl.classList.add('active');
+      adminEl.style.cssText='display:flex;flex-direction:column;height:100vh;overflow:hidden;';
+    }
+    var ava=document.getElementById('admin-tb-ava'); if(ava) ava.textContent=user.initials;
+    var un=document.getElementById('admin-tb-uname'); if(un) un.textContent=user.name;
+    var dh=document.getElementById('admin-dash-fecha-hoy');
+    if(dh) dh.textContent=new Date().toLocaleDateString('es-CO',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+    if(adminEl){
+      adminEl.querySelectorAll('.page').forEach(function(p){p.classList.remove('active');});
+      var dpg=adminEl.querySelector('.page'); if(dpg) dpg.classList.add('active');
+      adminEl.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active');});
+      var fn=adminEl.querySelector('.nav-item'); if(fn) fn.classList.add('active');
+    }
+    try{initAdminDashboard();}catch(e){}
+    try{showToast('Bienvenido, '+user.name,'success',3000);}catch(e){}
+    return;
+  }
+
+  // App Cliente / Operativo
+  var adminEl2=document.getElementById('admin-app');
+  if(adminEl2) adminEl2.style.cssText='display:none;';
+
+  var clienteEl=document.getElementById('cliente-app');
+  if(clienteEl) clienteEl.style.cssText='display:flex;flex-direction:column;height:100vh;overflow:hidden;';
+
+  var appEl=document.getElementById('app');
+  if(appEl) appEl.style.cssText='display:flex;flex-direction:column;flex:1;overflow:hidden;height:100%;';
+
+  // Forzar visibilidad
+  var appBody=appEl&&appEl.querySelector('.app-body');
+  if(appBody) appBody.style.cssText='display:flex;flex:1;min-height:0;overflow:hidden;';
+  var sbEl=document.getElementById('sidebar-app');
+  if(sbEl) sbEl.style.cssText='display:flex;flex-direction:column;width:220px;min-width:220px;background:white;border-right:1px solid #dee2e6;overflow-y:auto;';
+  var mc=appEl&&appEl.querySelector('.main-content');
+  if(mc) mc.style.cssText='flex:1;overflow-y:auto;padding:20px;min-height:0;background:#f4f6f9;';
+
+  // Topbar
+  var ava2=document.getElementById('tb-ava-txt'); if(ava2) ava2.textContent=user.initials||user.name.slice(0,2).toUpperCase();
+  var un2=document.getElementById('tb-uname-txt'); if(un2) un2.textContent=user.name+' · '+user.rol;
+  var badge=document.getElementById('tb-rol-badge');
+  if(badge){badge.textContent=user.rol;badge.style.display='inline-block';badge.style.background=user.rol==='Operativo Cliente'?'rgba(253,126,20,.25)':'rgba(30,107,184,.25)';badge.style.color=user.rol==='Operativo Cliente'?'#fd7e14':'#1e6bb8';badge.style.padding='2px 8px';badge.style.borderRadius='10px';badge.style.fontSize='10px';badge.style.fontWeight='700';}
+
+  // Mostrar sidebar correcto
+  window.mostrarSidebar(user.rol);
+
+  // Nombre cliente en sidebar
+  var scn=document.getElementById('sb-cliente-nombre');
+  if(scn) scn.textContent=user.name;
+
+  // Ocultar todas las páginas y activar la inicial
+  if(appEl) appEl.querySelectorAll('.page').forEach(function(p){p.classList.remove('active');});
+  var initPgId = user.rol==='Operativo Cliente' ? 'pg-tipologias-op' : 'pg-dashboard';
+  var initPg=document.getElementById(initPgId); if(initPg) initPg.classList.add('active');
+
+  // Entidad del cliente para filtros
+  if(user.rol==='Cliente' && user.entidad){
+    ['cf-entidad','cfg-cliente-sel','ejec-cliente-sel'].forEach(function(id){
+      var el=document.getElementById(id);
+      if(el){el.value=user.entidad; el.disabled=true;}
+    });
+    try{fijarEntidadClasificacion();}catch(e){}
+  }
+
+  setTimeout(function(){
+    if(user.rol==='Operativo Cliente'){
+      try{renderTipologiasOp();}catch(e){console.error('renderTipologiasOp:',e);}
+    } else {
+      try{updateDashboard();}catch(e){}
+      try{applyRoleRestrictions();}catch(e){}
+      try{animateProgress();}catch(e){}
+    }
+  },150);
+
+  try{_lsLoad();}catch(e){}
+  try{showToast('Bienvenido, '+user.name,'success',3000);}catch(e){}
+};
+
+// goPage compatible
+window.goPage = function(el, pgId) {
+  var adminEl=document.getElementById('admin-app');
+  var inAdmin=adminEl&&(adminEl.classList.contains('active')||adminEl.style.display==='flex');
+  if(inAdmin){
+    adminEl.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active');});
+    adminEl.querySelectorAll('.page').forEach(function(p){p.classList.remove('active');});
+    if(el) el.classList.add('active');
+    var pg2=adminEl.querySelector('#'+pgId)||document.getElementById(pgId);
+    if(pg2) pg2.classList.add('active'); return;
+  }
+  // Cliente / Operativo
+  var appEl=document.getElementById('app');
+  if(appEl) appEl.querySelectorAll('.page').forEach(function(p){p.classList.remove('active');});
+  var nav=document.getElementById('sidebar-app');
+  if(nav) nav.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active');});
+  if(el) el.classList.add('active');
+  var pg=document.getElementById(pgId); if(pg) pg.classList.add('active');
+  var mc=document.querySelector('#app .main-content'); if(mc) mc.scrollTop=0;
+
+  // Inits por página
+  var inits={
+    'pg-tipologias-op':   function(){try{renderTipologiasOp();}catch(e){console.error(e);}},
+    'pg-parametrizacion': function(){try{renderPaginaParametrizacion();}catch(e){console.error(e);}},
+    'pg-terceros-op':     function(){try{renderTercerosOp();}catch(e){console.error(e);}},
+    'pg-onedrive-cliente':function(){ window._odGridId='od-grid'; window._odBcId='od-breadcrumb'; setTimeout(odInit,80); },
+    'pg-dashboard':       function(){try{updateDashboard();}catch(e){}},
+    'pg-reportes':        function(){try{renderReportesCompleto();}catch(e){console.error('reportes:',e);}},
+    'pg-clasificacion':   function(){var pf=document.getElementById('cls-panel-form');if(pf)pf.style.display='block';var pd=document.getElementById('cls-panel-dash');if(pd)pd.style.display='none';try{fijarEntidadClasificacion();}catch(e){}},
+    'pg-cuestionario':    function(){try{sincronizarSelectorCuestionario();}catch(e){}},
+  };
+  if(inits[pgId]) setTimeout(inits[pgId],80);
+};
+
+// saveClasifFormYHabilitar
+window.saveClasifFormYHabilitar = function(){
+  try{saveClasifForm();}catch(e){console.error(e);}
+  setTimeout(function(){
+    var wrap=document.getElementById('cls-evaluar-wrap');if(!wrap)return;
+    var db=window.TERCEROS_DB||(typeof TERCEROS_DB!=='undefined'?TERCEROS_DB:{})||{};
+    var tiene=Object.values(db).some(function(t){return parseFloat(t.prom||0)>=3;});
+    wrap.style.display=tiene?'block':'none';
+    try{_lsSave();}catch(e){}
+  },600);
+};
+
+window.irAEvaluar=function(){var n=document.querySelector('#sb-cliente .nav-item[onclick*="pg-cuestionario"]')||document.querySelector('[onclick*="pg-cuestionario"]');if(n)n.click();};
+
+// ── renderTipologiasOp ──
+window.renderTipologiasOp=function(){
+  var pg=document.getElementById('pg-tipologias-op');if(!pg)return;
+  var ent=(window.currentUser&&window.currentUser.entidad)||'colpensiones';
+  var db=window.TIPOLOGIAS_DB||(typeof TIPOLOGIAS_DB!=='undefined'?TIPOLOGIAS_DB:{})||{};
+  var tips=db[ent]||[];
+  if(!tips.length){var all=[];Object.values(db).forEach(function(a){if(Array.isArray(a))all=all.concat(a);});tips=all;}
+  var escala=(window.TIP_NIVELES&&window.TIP_NIVELES[ent+'_escala'])||[
+    {nivel:1,etiqueta:'Nunca / No existe',        color:'#dc3545',descripcion:'El control no esta implementado'},
+    {nivel:2,etiqueta:'Raramente / Inicial',       color:'#fd7e14',descripcion:'Control documentado pero no aplicado'},
+    {nivel:3,etiqueta:'A veces / En proceso',      color:'#ffc107',descripcion:'Control parcialmente implementado'},
+    {nivel:4,etiqueta:'Frecuentemente / Definido', color:'#20c35a',descripcion:'Control implementado y monitoreado'},
+    {nivel:5,etiqueta:'Siempre / Optimizado',      color:'#1e6bb8',descripcion:'Control optimizado con mejora continua'},
+  ];
+  var h='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">';
+  h+='<div><h2 style="font-size:18px;font-weight:800;color:#1a3a5c;margin:0;">Tipologias y Escala de Valoracion</h2>';
+  h+='<div style="font-size:12px;color:#6c757d;margin-top:2px;">Paso 1 — Activa tipologias y personaliza la escala del AC</div></div>';
+  h+='<button onclick="openM(\'m-nueva-tipologia\')" style="padding:7px 16px;background:#1e6bb8;color:white;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;">+ Nueva Tipologia</button></div>';
+  h+='<div style="background:#fff8f0;border:1px solid #ffd99a;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#92400e;">Activa las tipologias. En "Preguntas del AC" personaliza cada pregunta. El cliente solo diligencia.</div>';
+  h+='<div style="background:white;border:1px solid #dee2e6;border-radius:8px;margin-bottom:16px;overflow:hidden;">';
+  h+='<div style="background:#fff8f0;border-bottom:1px solid #dee2e6;padding:12px 16px;"><b style="font-size:14px;color:#1a3a5c;">Tipologias configuradas ('+tips.length+')</b></div>';
+  h+='<div style="padding:14px 16px;">';
+  if(!tips.length){h+='<div style="text-align:center;padding:20px;color:#aaa;">Sin tipologias. Crea la primera con "+ Nueva Tipologia".</div>';}
+  else{tips.forEach(function(t){
+    var nP=(t.preguntas||[]).length,nA=(t.preguntas||[]).filter(function(p){return p.activo!==false;}).length,act=t.activo!==false,tid=String(t.id_tipologia);
+    h+='<div style="display:flex;align-items:center;gap:12px;padding:11px 13px;background:'+(act?'white':'#f8f9fa')+';border:1px solid '+(act?'#dee2e6':'#e9ecef')+';border-radius:6px;margin-bottom:8px;">';
+    h+='<div style="width:34px;height:34px;border-radius:8px;background:'+(act?'#fd7e14':'#adb5bd')+';display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:white;flex-shrink:0;">'+tid+'</div>';
+    h+='<div style="flex:1;"><div style="font-weight:700;font-size:13px;color:'+(act?'#1a3a5c':'#aaa')+';">'+t.nombre_tipologia+'</div>';
+    h+='<div style="font-size:11px;color:#6c757d;">'+nA+'/'+nP+' preguntas activas</div></div>';
+    h+='<div style="display:flex;gap:6px;">';
+    h+='<button onclick="opIrPreguntas(\''+tid+'\')" style="padding:5px 12px;background:#fff3e0;border:1px solid #ffd99a;color:#b45309;border-radius:5px;font-size:11.5px;font-weight:700;cursor:pointer;">Ver Preguntas</button>';
+    h+='<button onclick="opToggleTip(\''+tid+'\')" style="padding:5px 10px;background:'+(act?'#fef2f2':'#f0fdf4')+';border:1px solid '+(act?'#fca5a5':'#86efac')+';color:'+(act?'#dc3545':'#28a745')+';border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;">'+(act?'Quitar':'Activar')+'</button>';
+    h+='</div></div>';
+  });}
+  h+='</div></div>';
+  h+='<div style="background:white;border:1px solid #dee2e6;border-radius:8px;overflow:hidden;">';
+  h+='<div style="background:#f0fdfa;border-bottom:1px solid #dee2e6;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;">';
+  h+='<div><b style="font-size:14px;color:#1a3a5c;">Escala de Valoracion del Control</b><div style="font-size:11px;color:#6c757d;margin-top:1px;">Personaliza etiqueta y descripcion de cada nivel 1-5</div></div>';
+  h+='<button onclick="guardarEscalaOp()" style="padding:6px 14px;background:#28a745;color:white;border:none;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;">Guardar Escala</button></div>';
+  h+='<div style="padding:14px 16px;">';
+  h+='<div style="display:grid;grid-template-columns:40px 1fr 1fr;gap:8px;padding-bottom:8px;border-bottom:1px solid #eee;margin-bottom:8px;">';
+  h+='<span style="font-size:10px;font-weight:700;color:#aaa;">NIV.</span><span style="font-size:10px;font-weight:700;color:#aaa;">ETIQUETA</span><span style="font-size:10px;font-weight:700;color:#aaa;">DESCRIPCION</span></div>';
+  escala.forEach(function(n){
+    h+='<div style="display:grid;grid-template-columns:40px 1fr 1fr;gap:8px;align-items:center;margin-bottom:8px;">';
+    h+='<div style="width:32px;height:32px;border-radius:50%;background:'+n.color+';display:flex;align-items:center;justify-content:center;font-weight:800;color:white;font-size:14px;">'+n.nivel+'</div>';
+    h+='<input id="esc-etq-'+n.nivel+'" data-val="'+encodeURIComponent(n.etiqueta)+'" style="padding:7px 10px;border:1px solid #dee2e6;border-radius:5px;font-size:12px;font-family:inherit;">';
+    h+='<input id="esc-desc-'+n.nivel+'" data-val="'+encodeURIComponent(n.descripcion)+'" style="padding:7px 10px;border:1px solid #dee2e6;border-radius:5px;font-size:12px;font-family:inherit;">';
+    h+='</div>';
+  });
+  // Asignar valores después de render usando setTimeout externo
+  h+='</div></div>';
+  pg.innerHTML=h;
+  // Asignar valores de escala después de insertar en DOM
+  setTimeout(function(){
+    for(var i=1;i<=5;i++){
+      var e1=document.getElementById('esc-etq-'+i);
+      if(e1) e1.value=decodeURIComponent(e1.getAttribute('data-val')||'');
+      var e2=document.getElementById('esc-desc-'+i);
+      if(e2) e2.value=decodeURIComponent(e2.getAttribute('data-val')||'');
+    }
+  },50);
+};
+
+window.opToggleTip=function(tipId){var ent=(window.currentUser&&window.currentUser.entidad)||'colpensiones';var db=window.TIPOLOGIAS_DB||(typeof TIPOLOGIAS_DB!=='undefined'?TIPOLOGIAS_DB:{})||{};var arr=db[ent]||Object.values(db).reduce(function(a,b){return a.concat(b);},[]);var t=arr.find(function(x){return String(x.id_tipologia)===String(tipId);});if(!t)return;t.activo=(t.activo===false);try{_lsSave();}catch(e){}window.renderTipologiasOp();try{showToast((t.activo?'Activada: ':'Desactivada: ')+t.nombre_tipologia,'success',2000);}catch(e){}};
+window.opIrPreguntas=function(tipId){var nav=document.querySelector('#sb-operativo .nav-item[onclick*="pg-parametrizacion"]');if(nav)nav.click();else goPage(null,'pg-parametrizacion');setTimeout(function(){window.renderPaginaParametrizacion();setTimeout(function(){var sel=document.getElementById('param-tip-sel');if(sel){sel.value=String(tipId);window.renderParamPreguntas();}},100);},100);};
+window.guardarEscalaOp=function(){var ent=(window.currentUser&&window.currentUser.entidad)||'colpensiones';var cols=['','#dc3545','#fd7e14','#ffc107','#20c35a','#1e6bb8'];var esc=[];for(var i=1;i<=5;i++)esc.push({nivel:i,etiqueta:(document.getElementById('esc-etq-'+i)||{}).value||'Nivel '+i,descripcion:(document.getElementById('esc-desc-'+i)||{}).value||'',color:cols[i]});if(!window.TIP_NIVELES)window.TIP_NIVELES={};window.TIP_NIVELES[ent+'_escala']=esc;try{_lsSave();}catch(e){}try{showToast('Escala guardada','success',2000);}catch(e){}};
+window.opGetTip=function(tipId){var ent=(window.currentUser&&window.currentUser.entidad)||'colpensiones';var db=window.TIPOLOGIAS_DB||(typeof TIPOLOGIAS_DB!=='undefined'?TIPOLOGIAS_DB:{})||{};var arr=db[ent]||Object.values(db).reduce(function(a,b){return a.concat(b);},[]);return arr.find(function(t){return String(t.id_tipologia)===String(tipId);});};
+
+window.renderPaginaParametrizacion=function(){
+  var pg=document.getElementById('pg-parametrizacion');if(!pg)return;
+  var ent=(window.currentUser&&window.currentUser.entidad)||'colpensiones';
+  var db=window.TIPOLOGIAS_DB||(typeof TIPOLOGIAS_DB!=='undefined'?TIPOLOGIAS_DB:{})||{};
+  var tips=db[ent]?db[ent].filter(function(t){return t.activo!==false;}):Object.values(db).reduce(function(a,b){return a.concat(b);},[]).filter(function(t){return t.activo!==false;});
+  var opts=tips.map(function(t){return '<option value="'+t.id_tipologia+'">'+t.nombre_tipologia+'</option>';}).join('');
+  pg.innerHTML='<div style="margin-bottom:14px;"><h2 style="font-size:18px;font-weight:800;color:#1a3a5c;margin:0;">Preguntas del AC por Tipologia</h2><div style="font-size:12px;color:#6c757d;margin-top:2px;">Paso 2 — Activa, edita o agrega preguntas</div></div>'
+  +'<div style="background:#fff8f0;border:1px solid #ffd99a;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#92400e;">Las preguntas configuradas aqui son las que el cliente vera en su Ambiente de Control.</div>'
+  +'<div style="background:white;border:1px solid #dee2e6;border-radius:8px;overflow:hidden;">'
+  +'<div style="padding:12px 16px;border-bottom:1px solid #dee2e6;background:#f8f9fa;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+  +'<label style="font-size:12px;font-weight:700;color:#1a3a5c;">Tipologia:</label>'
+  +'<select id="param-tip-sel" onchange="window.renderParamPreguntas()" style="flex:1;padding:8px 12px;border:1px solid #86efac;border-radius:6px;font-size:13px;font-weight:600;font-family:inherit;">'
+  +'<option value="">-- Selecciona una tipologia --</option>'+opts+'</select>'
+  +'<span id="param-tip-hint" style="font-size:11px;color:#6c757d;"></span></div>'
+  +'<div id="param-stats" style="display:none;padding:8px 16px;background:#f0f4ff;border-bottom:1px solid #dee2e6;display:flex;gap:14px;align-items:center;flex-wrap:wrap;">'
+  +'Activas: <b id="param-st-act">0</b> | Inactivas: <b id="param-st-inact">0</b> | Total: <b id="param-st-tot">0</b>'
+  +'<button onclick="window.paramActivarTodas()" style="margin-left:auto;padding:4px 12px;background:#e8f8f2;border:1px solid #82d9ae;color:#28a745;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;">Activar todas</button>'
+  +'<button onclick="window.paramQuitarTodas()" style="padding:4px 12px;background:#fde8e8;border:1px solid #fca5a5;color:#dc3545;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;">Quitar todas</button></div>'
+  +'<div style="padding:14px 16px;">'
+  +'<div id="param-pregs-wrap" style="display:flex;flex-direction:column;gap:6px;max-height:350px;overflow-y:auto;margin-bottom:14px;"></div>'
+  +'<div id="param-empty" style="text-align:center;padding:24px;color:#aaa;"><div style="font-size:24px;margin-bottom:8px;">^</div><div>Selecciona una tipologia arriba para ver sus preguntas</div></div>'
+  +'<div id="param-add-wrap" style="display:none;padding:14px;background:#f8f9ff;border:1px dashed #a5b4fc;border-radius:6px;">'
+  +'<div style="font-size:11px;font-weight:700;color:#1a3a5c;text-transform:uppercase;margin-bottom:10px;">+ Agregar pregunta personalizada</div>'
+  +'<input id="param-nueva-txt" placeholder="Texto de la pregunta..." style="width:100%;padding:9px 12px;border:1px solid #dee2e6;border-radius:6px;font-size:12.5px;font-family:inherit;box-sizing:border-box;margin-bottom:8px;">'
+  +'<input id="param-nueva-ev" placeholder="Documentacion requerida (opcional)..." style="width:100%;padding:9px 12px;border:1px solid #dee2e6;border-radius:6px;font-size:12.5px;font-family:inherit;box-sizing:border-box;margin-bottom:8px;">'
+  +'<input id="param-nueva-ctrl" placeholder="Nombre del control..." style="width:100%;padding:9px 12px;border:1px solid #dee2e6;border-radius:6px;font-size:12.5px;font-family:inherit;box-sizing:border-box;margin-bottom:10px;">'
+  +'<div style="display:flex;justify-content:flex-end;"><button onclick="window.paramAgregarPregunta()" style="padding:8px 20px;background:#28a745;color:white;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;">+ Agregar</button></div>'
+  +'</div></div></div>';
+};
+
+window.renderParamPreguntas=function(){var tipId=(document.getElementById('param-tip-sel')||{}).value;var wrap=document.getElementById('param-pregs-wrap'),empty=document.getElementById('param-empty'),stats=document.getElementById('param-stats'),addW=document.getElementById('param-add-wrap'),hint=document.getElementById('param-tip-hint');if(!wrap)return;if(!tipId){wrap.innerHTML='';if(empty)empty.style.display='block';if(stats)stats.style.display='none';if(addW)addW.style.display='none';return;}var tip=window.opGetTip(tipId);if(!tip){wrap.innerHTML='<div style="color:#aaa;padding:12px;">Tipologia no encontrada.</div>';return;}if(empty)empty.style.display='none';if(addW)addW.style.display='block';var pregs=tip.preguntas||[],nA=pregs.filter(function(p){return p.activo!==false;}).length;if(document.getElementById('param-st-act'))document.getElementById('param-st-act').textContent=nA;if(document.getElementById('param-st-inact'))document.getElementById('param-st-inact').textContent=pregs.length-nA;if(document.getElementById('param-st-tot'))document.getElementById('param-st-tot').textContent=pregs.length;if(stats)stats.style.display=pregs.length?'flex':'none';if(hint)hint.textContent=nA+' activas de '+pregs.length;if(!pregs.length){wrap.innerHTML='<div style="text-align:center;padding:18px;color:#aaa;font-size:12px;">Sin preguntas. Agrega la primera abajo.</div>';return;}wrap.innerHTML=pregs.map(function(p,i){var act=p.activo!==false,txt=p.texto||p.pregunta||'',ev=p.evidencia||p.doc||'',tId=String(tipId);return '<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:'+(act?'white':'#f9fafb')+';border:1px solid '+(act?'#dee2e6':'#e9ecef')+';border-radius:6px;">'+'<div style="width:22px;height:22px;border-radius:50%;background:'+(act?'#1e6bb8':'#adb5bd')+';display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;color:white;flex-shrink:0;margin-top:2px;">'+(i+1)+'</div>'+'<div style="flex:1;font-size:12.5px;color:'+(act?'#222':'#aaa')+';line-height:1.5;">'+(txt||'(sin texto)')+(ev?'<div style="font-size:10.5px;color:#aaa;font-style:italic;margin-top:2px;">Doc: '+ev+'</div>':'')+'</div>'+'<div style="display:flex;gap:4px;">'+'<button onclick="window.paramToggle(\''+tId+'\','+i+')" style="padding:3px 8px;border-radius:4px;font-size:10.5px;font-weight:700;cursor:pointer;border:1px solid '+(act?'#fca5a5':'#86efac')+';background:'+(act?'#fef2f2':'#f0fdf4')+';color:'+(act?'#dc3545':'#28a745')+';font-family:inherit;">'+(act?'Quitar':'Activar')+'</button>'+'<button onclick="window.paramEditar(\''+tId+'\','+i+')" style="padding:3px 8px;border-radius:4px;font-size:10.5px;font-weight:700;cursor:pointer;border:1px solid #93c5fd;background:#eff6ff;color:#1e6bb8;font-family:inherit;">Editar</button>'+'<button onclick="window.paramEliminar(\''+tId+'\','+i+')" style="padding:3px 7px;border-radius:4px;font-size:10.5px;cursor:pointer;border:1px solid #fca5a5;background:#fef2f2;color:#dc3545;font-family:inherit;">X</button>'+'</div></div>';}).join('');};
+
+window.paramToggle=function(tipId,idx){var tip=window.opGetTip(tipId);if(!tip||!tip.preguntas||!tip.preguntas[idx])return;var p=tip.preguntas[idx];p.activo=(p.activo===false);try{_lsSave();}catch(e){}window.renderParamPreguntas();};
+window.paramEditar=function(tipId,idx){var tip=window.opGetTip(tipId);if(!tip||!tip.preguntas||!tip.preguntas[idx])return;var p=tip.preguntas[idx];var t=prompt('Texto:',p.texto||p.pregunta||'');if(t===null)return;p.texto=p.pregunta=t.trim();var ev=prompt('Documentacion:',p.evidencia||p.doc||'');p.evidencia=p.doc=(ev||'').trim();try{_lsSave();}catch(e){}window.renderParamPreguntas();};
+window.paramEliminar=function(tipId,idx){if(!confirm('Eliminar esta pregunta?'))return;var tip=window.opGetTip(tipId);if(!tip||!tip.preguntas)return;tip.preguntas.splice(idx,1);try{_lsSave();}catch(e){}window.renderParamPreguntas();};
+window.paramActivarTodas=function(){var tipId=(document.getElementById('param-tip-sel')||{}).value;if(!tipId)return;var tip=window.opGetTip(tipId);if(!tip||!tip.preguntas)return;tip.preguntas.forEach(function(p){p.activo=true;});try{_lsSave();}catch(e){}window.renderParamPreguntas();};
+window.paramQuitarTodas=function(){var tipId=(document.getElementById('param-tip-sel')||{}).value;if(!tipId)return;if(!confirm('Quitar todas?'))return;var tip=window.opGetTip(tipId);if(!tip||!tip.preguntas)return;tip.preguntas.forEach(function(p){p.activo=false;});try{_lsSave();}catch(e){}window.renderParamPreguntas();};
+window.paramAgregarPregunta=function(){var tipId=(document.getElementById('param-tip-sel')||{}).value;if(!tipId){try{showToast('Selecciona una tipologia','error',2000);}catch(e){}return;}var txt=(document.getElementById('param-nueva-txt')||{}).value||'';var ev=(document.getElementById('param-nueva-ev')||{}).value||'';var ctrl=(document.getElementById('param-nueva-ctrl')||{}).value||'';if(!txt.trim()){try{showToast('Escribe el texto','error',2000);}catch(e){}return;}var tip=window.opGetTip(tipId);if(!tip)return;if(!tip.preguntas)tip.preguntas=[];tip.preguntas.push({id_pregunta:Date.now(),texto:txt.trim(),pregunta:txt.trim(),evidencia:ev.trim(),doc:ev.trim(),control:ctrl.trim(),activo:true,tipo_valoracion:'ESTRELLAS',orden:tip.preguntas.length+1});['param-nueva-txt','param-nueva-ev','param-nueva-ctrl'].forEach(function(id){var el=document.getElementById(id);if(el)el.value='';});try{_lsSave();}catch(e){}window.renderParamPreguntas();try{showToast('Pregunta agregada','success',2500);}catch(e){}};
+
+window.renderTercerosOp=function(){var pg=document.getElementById('pg-terceros-op');if(!pg)return;var ent=(window.currentUser&&window.currentUser.entidad)||null;var db=window.TERCEROS_DB||(typeof TERCEROS_DB!=='undefined'?TERCEROS_DB:{})||{};var lista=Object.values(db).filter(function(t){return !ent||t.entidad===ent;});var h='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;"><div><h2 style="font-size:18px;font-weight:800;color:#1a3a5c;margin:0;">Aprobar Terceros para Evaluacion</h2><div style="font-size:12px;color:#6c757d;margin-top:2px;">Habilita cuales terceros puede evaluar el cliente en AC y Matriz</div></div></div><div style="background:#f0fdf4;border:1px solid #86efac;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#166534;">Activa los terceros habilitados para evaluacion. Los bloqueados no aparecen en AC ni Matriz.</div>';if(!lista.length){h+='<div style="text-align:center;padding:30px;color:#aaa;">Sin terceros registrados. Ve a Registrar Tercero.</div>';}else{var zc={Critico:'#dc3545',EXTREMO:'#dc3545',Alto:'#fd7e14',ALTO:'#fd7e14',Medio:'#ffc107',MEDIO:'#ffc107',Bajo:'#28a745',BAJO:'#28a745'};h+='<div style="background:white;border:1px solid #dee2e6;border-radius:8px;overflow:hidden;"><table style="width:100%;border-collapse:collapse;"><thead><tr style="background:#1a3a5c;"><th style="padding:10px 14px;font-size:11px;font-weight:700;color:white;text-align:left;">Tercero</th><th style="padding:10px 8px;font-size:11px;font-weight:700;color:white;text-align:center;">Prom.</th><th style="padding:10px 8px;font-size:11px;font-weight:700;color:white;text-align:center;">Zona</th><th style="padding:10px 8px;font-size:11px;font-weight:700;color:white;text-align:center;">Habilitado</th></tr></thead><tbody>';lista.forEach(function(t,i){var nit=t.nit||'',zona=t.zona||'',prom=parseFloat(t.prom||0),hab=t.habilitado_ac!==false;h+='<tr style="border-bottom:1px solid #dee2e6;background:'+(i%2?'#f8f9fa':'white')+'"><td style="padding:10px 14px;"><div style="font-weight:700;font-size:13px;color:#1a3a5c;">'+(t.nombre||'')+'</div><div style="font-size:10.5px;color:#aaa;">'+nit+'</div></td><td style="padding:10px 8px;text-align:center;font-weight:800;font-size:15px;color:#1a3a5c;">'+(prom>0?prom.toFixed(1):'—')+'</td><td style="padding:10px 8px;text-align:center;"><span style="padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:white;background:'+(zc[zona]||'#aaa')+';">'+zona+'</span></td><td style="padding:10px 8px;text-align:center;"><button onclick="window.toggleHabilitadoAC(\''+nit+'\')" style="padding:4px 12px;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid '+(hab?'#86efac':'#fca5a5')+';background:'+(hab?'#f0fdf4':'#fef2f2')+';color:'+(hab?'#28a745':'#dc3545')+';font-family:inherit;">'+(hab?'Habilitado':'Bloqueado')+'</button></td></tr>';});h+='</tbody></table></div>';}pg.innerHTML=h;};
+window.toggleHabilitadoAC=function(nit){var db=window.TERCEROS_DB||(typeof TERCEROS_DB!=='undefined'?TERCEROS_DB:{})||{};var t=db[nit];if(!t)return;t.habilitado_ac=(t.habilitado_ac===false);try{_lsSave();}catch(e){}window.renderTercerosOp();try{showToast((t.habilitado_ac?'Habilitado: ':'Bloqueado: ')+t.nombre,'success',2000);}catch(e){}};
+
+// OneDrive
+var OD_KEY='od_v1',odFS=null,odPath=[];
+window.odInit=function(){try{var s=localStorage.getItem(OD_KEY);odFS=s?JSON.parse(s):null;}catch(e){odFS=null;}if(!odFS)odFS={id:'root',type:'folder',children:[{id:'f1',name:'Cuestionario AC',type:'folder',children:[],fecha:''},{id:'f2',name:'Matriz de Riesgos',type:'folder',children:[],fecha:''},{id:'f3',name:'Contratos',type:'folder',children:[],fecha:''},{id:'f4',name:'Informes',type:'folder',children:[],fecha:''}]};odPath=[];window.odRender();};
+window.odSave=function(){try{localStorage.setItem(OD_KEY,JSON.stringify(odFS));}catch(e){}};
+window.odCurrentFolder=function(){var node=odFS;odPath.forEach(function(step){node=(node.children||[]).find(function(c){return c.id===step.id;})||node;});return node;};
+window.odRender=function(){var folder=window.odCurrentFolder();var grid=document.getElementById('od-grid');var bc=document.getElementById('od-breadcrumb');if(!grid||!bc)return;var bHtml='<span onclick="window.odNavTo(-1)" style="cursor:pointer;color:#1e6bb8;font-weight:700;">Inicio</span>';odPath.forEach(function(step,i){bHtml+=' / <span onclick="window.odNavTo('+i+')" style="cursor:pointer;color:#1e6bb8;">'+step.name+'</span>';});bc.innerHTML=bHtml;var kids=folder.children||[];if(!kids.length){grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:40px;color:#aaa;"><div style="font-size:40px;margin-bottom:10px;">+</div><div style="font-weight:600;">Carpeta vacia</div></div>';return;}grid.innerHTML=kids.map(function(item){var ext=item.type==='folder'?'folder':(item.name.split('.').pop()||'').toLowerCase();var icons={folder:'[DIR]',pdf:'[PDF]',doc:'[DOC]',docx:'[DOC]',xls:'[XLS]',xlsx:'[XLS]',png:'[IMG]',jpg:'[IMG]'};var color=item.type==='folder'?'#ffc107':'#1e6bb8';var lbl=icons[ext]||'[FILE]';var meta=item.fecha?'<div style="font-size:10px;color:#aaa;margin-top:2px;">'+item.fecha+'</div>':'';return '<div onclick="window.odClick(\''+item.id+'\')" style="background:white;border:1px solid #dee2e6;border-radius:8px;padding:14px 10px;text-align:center;cursor:pointer;position:relative;" onmouseover="this.style.borderColor=\'#1e6bb8\'" onmouseout="this.style.borderColor=\'#dee2e6\'">'+'<div style="font-size:26px;color:'+color+';margin-bottom:6px;font-weight:800;font-family:monospace;">'+lbl+'</div>'+'<div style="font-size:11.5px;font-weight:600;color:#222;word-break:break-word;">'+item.name+'</div>'+meta+'<button onclick="event.stopPropagation();window.odEliminar(\''+item.id+'\')" style="position:absolute;top:4px;right:4px;background:none;border:none;color:#ccc;font-size:13px;cursor:pointer;padding:2px 5px;">x</button></div>';}).join('');};
+window.odClick=function(id){var folder=window.odCurrentFolder();var item=(folder.children||[]).find(function(c){return c.id===id;});if(!item)return;if(item.type==='folder'){odPath.push({id:item.id,name:item.name});window.odRender();}else if(item.dataURL){var a=document.createElement('a');a.href=item.dataURL;a.download=item.name;a.click();}};
+window.odNavTo=function(idx){odPath=idx<0?[]:odPath.slice(0,idx+1);window.odRender();};
+window.odNuevaCarpeta=function(){var n=prompt('Nombre:');if(!n||!n.trim())return;var f=window.odCurrentFolder();if(!f.children)f.children=[];f.children.push({id:'f_'+Date.now(),name:n.trim(),type:'folder',children:[],fecha:new Date().toLocaleDateString('es-CO')});window.odSave();window.odRender();try{showToast('Carpeta creada','success',2000);}catch(e){}};
+window.odSubirArchivos=function(files){if(!files||!files.length)return;var f=window.odCurrentFolder();if(!f.children)f.children=[];var done=0,total=files.length;Array.from(files).forEach(function(file){var r=new FileReader();r.onload=function(e){f.children.push({id:'file_'+Date.now()+'_'+Math.random().toString(36).slice(2),name:file.name,type:'file',size:file.size,dataURL:e.target.result,fecha:new Date().toLocaleDateString('es-CO')});done++;if(done===total){window.odSave();window.odRender();try{showToast(done+' archivo(s) subido(s)','success',2500);}catch(e2){}}};r.readAsDataURL(file);});};
+window.odEliminar=function(id){if(!confirm('Eliminar?'))return;var f=window.odCurrentFolder();f.children=(f.children||[]).filter(function(c){return c.id!==id;});window.odSave();window.odRender();};
+window.odFmtSize=function(b){if(b<1024)return b+'B';if(b<1048576)return Math.round(b/1024)+'KB';return (b/1048576).toFixed(1)+'MB';};
+
+console.log('App lista. Roles: IS / Operativo / Cliente');
 </script>
