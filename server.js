@@ -2,8 +2,6 @@ const express  = require('express');
 const sql      = require('mssql');
 const cors     = require('cors');
 const path     = require('path');
-require('dotenv').config();
-const { DefaultAzureCredential } = require('@azure/identity'); // ✅ CAMBIO 1
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -14,24 +12,24 @@ app.use((req, res, next) => {
   next();
 });
 
-// ✅ CAMBIO 2: ruta raíz para que Azure no muestre "Cannot GET /"
+// ruta raíz para que Azure no muestre "Cannot GET /"
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-const credential = new DefaultAzureCredential(); // ✅ CAMBIO 1
 let pool;
 
 async function conectarDB() {
   try {
     if (pool) { try { await pool.close(); } catch(e) {} }
-    const token = (await credential.getToken('https://database.windows.net/.default')).token;
     const DB_SERVER   = process.env.DB_SERVER   || 'azure-iseguras.database.windows.net';
     const DB_DATABASE = process.env.DB_DATABASE || 'PruebaAplicacion';
+    const DB_USER     = process.env.DB_USER;
+    const DB_PASSWORD = process.env.DB_PASSWORD;
     pool = await sql.connect({
       server: DB_SERVER, database: DB_DATABASE,
+      user: DB_USER, password: DB_PASSWORD,
       options: { encrypt: true, trustServerCertificate: false },
-      authentication: { type: 'azure-active-directory-access-token', options: { token } },
       connectionTimeout: 30000, requestTimeout: 60000
     });
     console.log('✅ Conectado a:', DB_DATABASE);
