@@ -162,7 +162,7 @@ app.use(express.static('public'));
 
 // Servir el HTML de SGRT
 app.get('/', (req, res) => {
-  res.sendFile(__dirname + '/public/Index_v9_CAMBIOS.html');
+  res.sendFile(__dirname + '/public/Index.html');
 });
 
 // ═══ MANEJO DE ERRORES ════════════════════════════════════════════
