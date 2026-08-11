@@ -2,12 +2,14 @@
 // SGRT v9 — Servidor Node.js para Azure App Service
 // ✅ Sin warnings de deprecación
 // ✅ Compatible con Node 18+
+// ✅ Busca Index.html en múltiples ubicaciones
 // ═══════════════════════════════════════════════════════════════════
 
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
+const fs = require('fs');
 
 // Suprimir warnings (opcional, pero limpio)
 process.noDeprecation = true;
@@ -202,16 +204,58 @@ app.delete('/api/limpiar-bd', (req, res) => {
 // ═══ SERVIR ARCHIVOS ESTÁTICOS ════════════════════════════════════
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ⭐ FIX: Buscar Index.html en múltiples ubicaciones
+function findIndexHtml() {
+  const possiblePaths = [
+    path.join(__dirname, 'public', 'Index.html'),
+    path.join(__dirname, 'public', 'index.html'),
+    path.join(__dirname, 'Index.html'),
+    path.join(__dirname, 'index.html'),
+    '/home/site/wwwroot/Index.html',
+    '/home/site/wwwroot/public/Index.html'
+  ];
+  
+  for (const filePath of possiblePaths) {
+    try {
+      if (fs.existsSync(filePath)) {
+        console.log(`✅ Index.html encontrado en: ${filePath}`);
+        return filePath;
+      }
+    } catch (e) {
+      // Ignorar errores de lectura
+    }
+  }
+  
+  return null;
+}
+
 // Servir el HTML de SGRT
 app.get('/', (req, res) => {
-  const indexPath = path.join(__dirname, 'public', 'Index.html');
+  const indexPath = findIndexHtml();
+  
+  if (!indexPath) {
+    return res.status(500).json({
+      ok: false,
+      error: 'No se encontró Index.html',
+      message: 'Verifica que Index.html esté en la raíz o en /public',
+      checked_paths: [
+        'public/Index.html',
+        'public/index.html',
+        'Index.html',
+        'index.html',
+        '/home/site/wwwroot/Index.html',
+        '/home/site/wwwroot/public/Index.html'
+      ]
+    });
+  }
+  
   res.sendFile(indexPath, (err) => {
     if (err) {
+      console.error('Error sirviendo Index.html:', err);
       res.status(500).json({
         ok: false,
-        error: 'No se encontró Index.html',
-        path: indexPath,
-        message: 'Asegúrate de que Index.html esté en /public'
+        error: 'Error sirviendo Index.html',
+        message: err.message
       });
     }
   });
