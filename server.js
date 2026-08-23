@@ -168,7 +168,7 @@ app.get('/test-db', async (req, res) => {
 
     const result = await request.query(`
       SELECT
-        GETDATE() AS current_time,
+        GETDATE() AS server_time,
         @@SERVERNAME AS server_name,
         DB_NAME() AS database_name
     `);
