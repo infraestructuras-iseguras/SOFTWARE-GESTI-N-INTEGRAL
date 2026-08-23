@@ -52,4 +52,4 @@ jobs:
           app-name: 'SOFTWARE-GESTIN-INTEGRAL'
           slot-name: 'Production'
           package: .
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_64435D05D296481EA3F09D1331906169 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_53B7A944A68B46E5BA473E8A6637A59F }}
