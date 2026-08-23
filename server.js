@@ -186,7 +186,7 @@ app.get('/test-db', async (req, res) => {
       server_info: {
         server_name: result.recordset[0]?.server_name,
         database_name: result.recordset[0]?.database_name,
-        server_time: result.recordset[0]?.current_time
+        server_time: result.recordset[0]?.server_time
       }
 
     });
