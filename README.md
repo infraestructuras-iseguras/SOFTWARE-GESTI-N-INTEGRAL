@@ -1,11 +1,12 @@
-# SGRT — Proyecto modular
+# SOFTWARE-GESTI-N-INTEGRAL
 
 Esta versión separa la estructura HTML, los estilos CSS y la lógica JavaScript en archivos independientes. Se conserva el orden de carga de la aplicación para mantener las dependencias entre funciones globales y los botones definidos en el HTML.
 
 ## Estructura
 
 ```text
-SGRT_MODULAR/
+SOFTWARE-GESTI-N-INTEGRAL/
+├── public
 ├── index.html
 ├── README.md
 ├── CAMBIOS_RONDA_ADMIN_COLPENSIONES.md
