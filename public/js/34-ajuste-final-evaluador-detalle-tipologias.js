@@ -202,29 +202,28 @@
   };
 
   function aplicar(){
+    // Ajuste 34 queda dedicado únicamente al listado del Evaluador.
+    // La sección Tipologías evaluadas del Administrador se gestiona exclusivamente
+    // en el ajuste 35 para evitar duplicar botones "Ver detalle" durante los renders.
     try{ limpiarTablaEvaluador(); }catch(e){ console.warn('[SGRT34] Evaluador:',e); }
-    try{ patchTipologiasEvaluadas(); }catch(e2){ console.warn('[SGRT34] Tipologías por contrato:',e2); }
   }
 
-  // Proteger los renders existentes sin cambiar su lógica.
+  // Proteger solo el render de clasificación/evaluador sin tocar Reportes AC.
   var prevCls=window.clsRender;
   if(typeof prevCls==='function') window.clsRender=function(){
     var r=prevCls.apply(this,arguments); setTimeout(aplicar,50); setTimeout(aplicar,160); return r;
   };
-  var prevRpt=window.renderReportesAC;
-  if(typeof prevRpt==='function') window.renderReportesAC=function(){
-    var r=prevRpt.apply(this,arguments); setTimeout(aplicar,80); setTimeout(aplicar,200); return r;
-  };
 
-  // MutationObserver ligero: solo observa las dos zonas que pueden repintarse.
+  // MutationObserver limitado al listado del Evaluador. No observar cq-reportes-body:
+  // hacerlo desde dos módulos distintos provocaba la repetición de "Ver detalle".
   function observe(id){
     var el=document.getElementById(id); if(!el||el.dataset.sgrt34Observed==='1') return;
     el.dataset.sgrt34Observed='1';
     new MutationObserver(function(){ setTimeout(aplicar,0); }).observe(el,{childList:true,subtree:true});
   }
   document.addEventListener('DOMContentLoaded',function(){
-    setTimeout(function(){ observe('cls-dash-tbody'); observe('cq-reportes-body'); aplicar(); },250);
+    setTimeout(function(){ observe('cls-dash-tbody'); aplicar(); },250);
     setTimeout(aplicar,850);
   });
-  if(document.readyState!=='loading') setTimeout(function(){observe('cls-dash-tbody');observe('cq-reportes-body');aplicar();},180);
+  if(document.readyState!=='loading') setTimeout(function(){observe('cls-dash-tbody');aplicar();},180);
 })();
