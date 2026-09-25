@@ -1,0 +1,4274 @@
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const https = require('https');
+const os = require('os');
+const { DefaultAzureCredential } = require('@azure/identity');
+
+// ================================================================
+// SQL SERVER
+// ================================================================
+
+let sql;
+
+try {
+  sql = require('mssql');
+  console.log('✅ Módulo mssql importado correctamente');
+} catch (e) {
+  console.error('❌ Error importando mssql.');
+  console.error('Ejecuta: npm install mssql');
+  process.exit(1);
+}
+
+// ================================================================
+// VARIABLES DE ENTORNO
+// ================================================================
+
+try {
+  require('dotenv').config();
+} catch (e) {
+  console.warn('⚠️ dotenv no disponible. Usando variables del sistema.');
+}
+
+// ================================================================
+// APLICACIÓN
+// ================================================================
+
+const app = express();
+
+const PORT = process.env.PORT || 3000;
+
+// ================================================================
+// MIDDLEWARE
+// ================================================================
+
+app.use(cors());
+
+app.use(
+  express.json({
+    limit: '50mb'
+  })
+);
+
+app.use(
+  express.urlencoded({
+    limit: '50mb',
+    extended: true
+  })
+);
+
+// ================================================================
+// CONFIGURACIÓN AZURE SQL
+// ================================================================
+
+// Compatibilidad con la configuración original del App Service:
+// DB_DATABASE era el nombre usado originalmente; DB_NAME también se acepta.
+const DB_SERVER =
+  process.env.DB_SERVER ||
+  'azure-iseguras.database.windows.net';
+
+const DB_DATABASE =
+  process.env.DB_DATABASE ||
+  process.env.DB_NAME ||
+  'PruebaAplicacion';
+
+const DB_PORT =
+  Number(process.env.DB_PORT || 1433);
+
+const baseSqlConfig = {
+  server: DB_SERVER,
+  database: DB_DATABASE,
+  port: DB_PORT,
+
+  options: {
+    encrypt: true,
+    trustServerCertificate: false
+  },
+
+  pool: {
+    min: 0,
+    max: 10,
+    idleTimeoutMillis: 30000
+  },
+
+  connectionTimeout: 30000,
+  requestTimeout: 60000
+};
+
+// Se mantiene el nombre `config` porque el resto del servidor ya lo usa.
+// Si existen credenciales SQL explícitas, se respetan. En Azure, el flujo
+// original usa Managed Identity / Microsoft Entra ID mediante access token.
+let config = { ...baseSqlConfig };
+
+async function buildSqlConnectionConfig() {
+  if (process.env.DB_USER && process.env.DB_PASSWORD) {
+    return {
+      ...baseSqlConfig,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD
+    };
+  }
+
+  const credential = new DefaultAzureCredential();
+  const token = await credential.getToken(
+    'https://database.windows.net/.default'
+  );
+
+  if (!token || !token.token) {
+    throw new Error(
+      'Microsoft Entra ID no devolvió un token para Azure SQL'
+    );
+  }
+
+  return {
+    ...baseSqlConfig,
+    authentication: {
+      type: 'azure-active-directory-access-token',
+      options: {
+        token: token.token
+      }
+    }
+  };
+}
+
+// ================================================================
+// POOL GLOBAL
+// ================================================================
+
+let pool = null;
+
+// ================================================================
+// ESTADO EXTENDIDO SGRT
+// ================================================================
+// dbo.Terceros conserva el maestro real. Esta tabla auxiliar guarda en JSON
+// contratos, supervisores, clasificación por contrato, aprobaciones y estado
+// del flujo sin exigir cambios a la estructura original de dbo.Terceros.
+let sgrtStateReady = false;
+
+async function ensureSGRTStateTable() {
+  if (!pool || !pool.connected) return false;
+  try {
+    const request = new sql.Request(pool);
+    await request.query(`
+      IF OBJECT_ID('dbo.SGRT_Tercero_Estado', 'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.SGRT_Tercero_Estado (
+          NIT NVARCHAR(50) NOT NULL PRIMARY KEY,
+          Payload NVARCHAR(MAX) NULL,
+          UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_SGRT_Tercero_Estado_UpdatedAt DEFAULT SYSUTCDATETIME()
+        );
+      END
+    `);
+    sgrtStateReady = true;
+    console.log('✅ Tabla de estado SGRT disponible: dbo.SGRT_Tercero_Estado');
+    return true;
+  } catch (error) {
+    sgrtStateReady = false;
+    console.warn('⚠️ No se pudo crear/verificar dbo.SGRT_Tercero_Estado:', error.message);
+    console.warn('   Ejecuta backend/SQL_SETUP_SGRT_ESTADO.sql con un usuario con permisos DDL.');
+    return false;
+  }
+}
+
+async function upsertSGRTState(nit, payload) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+  const request = new sql.Request(pool);
+  request.input('nit', sql.NVarChar(50), String(nit));
+  request.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(payload || {}));
+  await request.query(`
+    MERGE dbo.SGRT_Tercero_Estado AS target
+    USING (SELECT @nit AS NIT) AS src
+      ON target.NIT = src.NIT
+    WHEN MATCHED THEN
+      UPDATE SET Payload = @payload, UpdatedAt = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+      INSERT (NIT, Payload, UpdatedAt) VALUES (@nit, @payload, SYSUTCDATETIME());
+  `);
+}
+
+
+// ================================================================
+// PAPELERA / RECUPERACIÓN ISEGURAS
+// ================================================================
+// Antes de operaciones destructivas importantes se guarda una instantánea en
+// Azure SQL. ISEGURAS puede restaurarla posteriormente desde su módulo de
+// Papelera y Recuperación. La telemetría masiva antigua se mantiene fuera de
+// esta papelera para no duplicar millones de filas de auditoría.
+let sgrtRecycleReady = false;
+
+async function ensureSGRTRecycleTable() {
+  if (!pool || !pool.connected) return false;
+  try {
+    await new sql.Request(pool).query(`
+      IF OBJECT_ID('dbo.SGRT_RecycleBin', 'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.SGRT_RecycleBin (
+          ID BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+          DeletedAt DATETIME2 NOT NULL CONSTRAINT DF_SGRT_RecycleBin_DeletedAt DEFAULT SYSUTCDATETIME(),
+          EntityType NVARCHAR(80) NOT NULL,
+          NIT NVARCHAR(80) NULL,
+          ContractNo NVARCHAR(140) NULL,
+          ItemId NVARCHAR(220) NULL,
+          Label NVARCHAR(600) NULL,
+          Payload NVARCHAR(MAX) NOT NULL,
+          DeletedByLogin NVARCHAR(120) NULL,
+          DeletedByName NVARCHAR(220) NULL,
+          DeletedByRole NVARCHAR(140) NULL,
+          EntityId NVARCHAR(140) NULL,
+          Status NVARCHAR(30) NOT NULL CONSTRAINT DF_SGRT_RecycleBin_Status DEFAULT N'Deleted',
+          RestoredAt DATETIME2 NULL,
+          RestoredByLogin NVARCHAR(120) NULL,
+          RestoredByName NVARCHAR(220) NULL
+        );
+        CREATE INDEX IX_SGRT_RecycleBin_StatusDate ON dbo.SGRT_RecycleBin(Status, DeletedAt DESC);
+        CREATE INDEX IX_SGRT_RecycleBin_NIT ON dbo.SGRT_RecycleBin(NIT, DeletedAt DESC);
+      END
+    `);
+    sgrtRecycleReady = true;
+    return true;
+  } catch (e) {
+    sgrtRecycleReady = false;
+    console.warn('⚠️ No se pudo crear/verificar dbo.SGRT_RecycleBin:', e.message);
+    return false;
+  }
+}
+
+function sgRecycleActor(actor) {
+  actor = actor || {};
+  return {
+    login: String(actor.userLogin || actor.login || actor.user || '').slice(0,120),
+    name: String(actor.userName || actor.name || actor.nombre || '').slice(0,220),
+    role: String(actor.userRole || actor.rol || actor.role || '').slice(0,140),
+    entityId: String(actor.entityId || actor.entidad || '').slice(0,140)
+  };
+}
+
+async function sgRecycleInsert(item, actor, transaction) {
+  if (!sgrtRecycleReady) await ensureSGRTRecycleTable();
+  if (!sgrtRecycleReady) return null; // El borrado original no se bloquea si falta DDL.
+  const a = sgRecycleActor(actor);
+  const rq = transaction ? new sql.Request(transaction) : new sql.Request(pool);
+  rq.input('type', sql.NVarChar(80), String(item.entityType || 'registro').slice(0,80));
+  rq.input('nit', sql.NVarChar(80), item.nit == null ? null : String(item.nit).slice(0,80));
+  rq.input('contract', sql.NVarChar(140), item.contractNo == null ? null : String(item.contractNo).slice(0,140));
+  rq.input('itemId', sql.NVarChar(220), item.itemId == null ? null : String(item.itemId).slice(0,220));
+  rq.input('label', sql.NVarChar(600), item.label == null ? null : String(item.label).slice(0,600));
+  rq.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(item.payload == null ? null : item.payload));
+  rq.input('login', sql.NVarChar(120), a.login || null);
+  rq.input('name', sql.NVarChar(220), a.name || null);
+  rq.input('role', sql.NVarChar(140), a.role || null);
+  rq.input('entityId', sql.NVarChar(140), a.entityId || null);
+  const rs = await rq.query(`
+    INSERT INTO dbo.SGRT_RecycleBin
+      (EntityType,NIT,ContractNo,ItemId,Label,Payload,DeletedByLogin,DeletedByName,DeletedByRole,EntityId)
+    OUTPUT INSERTED.ID
+    VALUES (@type,@nit,@contract,@itemId,@label,@payload,@login,@name,@role,@entityId)
+  `);
+  return rs.recordset && rs.recordset[0] ? Number(rs.recordset[0].ID) : null;
+}
+
+function sgIsISEGURASRequest(req) {
+  const role = String(req.headers['x-sgrt-role'] || '').trim().toLowerCase();
+  const login = String(req.headers['x-sgrt-user'] || '').trim().toLowerCase();
+  return role === 'is' || role === 'iseguras' || role.includes('superadmin') ||
+    role.includes('infraestructuras seguras') || login === 'iseguras2026' || login === 'is';
+}
+
+function sgDeepRestore(snapshot, current) {
+  if (current == null) return sgrtPlainClone(snapshot);
+  if (snapshot == null) return sgrtPlainClone(current);
+  if (Array.isArray(snapshot) || Array.isArray(current)) {
+    if (Array.isArray(current) && current.length) return sgrtPlainClone(current);
+    return sgrtPlainClone(snapshot);
+  }
+  if (typeof snapshot === 'object' && typeof current === 'object') {
+    const out = sgrtPlainClone(snapshot) || {};
+    Object.keys(current).forEach((k) => { out[k] = sgDeepRestore(snapshot && snapshot[k], current[k]); });
+    return out;
+  }
+  return sgrtPlainClone(current);
+}
+
+async function sgRestoreRecycleItem(id, actor) {
+  if (!sgrtRecycleReady) await ensureSGRTRecycleTable();
+  if (!sgrtRecycleReady) throw new Error('La papelera SGRT no está disponible');
+  const tx = new sql.Transaction(pool);
+  await tx.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const rr = new sql.Request(tx);
+    rr.input('id', sql.BigInt, Number(id));
+    const rs = await rr.query(`SELECT TOP 1 * FROM dbo.SGRT_RecycleBin WITH (UPDLOCK,HOLDLOCK) WHERE ID=@id`);
+    if (!rs.recordset.length) throw new Error('Elemento de papelera no encontrado');
+    const row = rs.recordset[0];
+    if (String(row.Status || '') !== 'Deleted') throw new Error('Este elemento ya fue restaurado');
+    let snap = null;
+    try { snap = JSON.parse(row.Payload || 'null'); } catch (e) { throw new Error('La copia de recuperación está dañada'); }
+    const nit = String(row.NIT || '');
+    const contract = String(row.ContractNo || '');
+    const type = String(row.EntityType || '');
+
+    const loadState = async () => {
+      const rq = new sql.Request(tx); rq.input('nit', sql.NVarChar(50), nit);
+      const sr = await rq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`);
+      let state = {};
+      if (sr.recordset.length) { try { state = JSON.parse(sr.recordset[0].Payload || '{}'); } catch (e) { state = {}; } }
+      return {state: state && typeof state === 'object' ? state : {}, exists: !!sr.recordset.length};
+    };
+    const saveState = async (state, exists) => {
+      const wr = new sql.Request(tx); wr.input('nit', sql.NVarChar(50), nit); wr.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(state || {}));
+      if (exists) await wr.query(`UPDATE dbo.SGRT_Tercero_Estado SET Payload=@payload,UpdatedAt=SYSUTCDATETIME() WHERE NIT=@nit`);
+      else await wr.query(`INSERT INTO dbo.SGRT_Tercero_Estado(NIT,Payload,UpdatedAt) VALUES(@nit,@payload,SYSUTCDATETIME())`);
+    };
+
+    if (type === 'tercero_full') {
+      const t = (snap && snap.tercero) || {};
+      const rq = new sql.Request(tx);
+      rq.input('nit', sql.NVarChar(50), String(t.NIT || nit));
+      rq.input('nombre', sql.NVarChar(255), String(t.Nombre_Tercero || t.nombre || 'Tercero recuperado'));
+      rq.input('servicio', sql.NVarChar(255), t.Servicio_Contratado == null ? null : String(t.Servicio_Contratado));
+      rq.input('domicilio', sql.NVarChar(255), t.Domicilio == null ? null : String(t.Domicilio));
+      await rq.query(`
+        MERGE dbo.Terceros AS target USING (SELECT @nit AS NIT) src ON target.NIT=src.NIT
+        WHEN MATCHED THEN UPDATE SET Nombre_Tercero=@nombre,Servicio_Contratado=@servicio,Domicilio=@domicilio
+        WHEN NOT MATCHED THEN INSERT(NIT,Nombre_Tercero,Servicio_Contratado,Domicilio,Fecha_Registro)
+          VALUES(@nit,@nombre,@servicio,@domicilio,GETDATE());
+      `);
+      if (snap && snap.estado_sgrt) {
+        const cur = await loadState();
+        await saveState(sgDeepRestore(snap.estado_sgrt, cur.exists ? cur.state : null), cur.exists);
+      }
+    } else if (type === 'state_full') {
+      const cur = await loadState();
+      await saveState(sgDeepRestore((snap && snap.estado_sgrt) || snap || {}, cur.exists ? cur.state : null), cur.exists);
+    } else if (type === 'contract_evaluator') {
+      const cur = await loadState(); const st = hydrateEvaluatorResponses(cur.state || {}); const blocks=(snap&&snap.blocks)||{};
+      ['respuestasACPorContrato','borradoresACPorContrato','acPorContrato','promPorContrato','respuestasPorContrato','_respuestasPorContrato'].forEach((b)=>{
+        if (!st[b] || typeof st[b] !== 'object' || Array.isArray(st[b])) st[b] = {};
+        if (Object.prototype.hasOwnProperty.call(blocks,b)) st[b][contract] = sgrtPlainClone(blocks[b]);
+      });
+      if (blocks._respuestas) { st._respuestasContrato=contract; st._respuestas=sgrtPlainClone(blocks._respuestas); }
+      await saveState(st, cur.exists);
+    } else if (type === 'evidence_ac' || type === 'evidence_risk') {
+      const cur = await loadState(); const st = hydrateEvaluatorResponses(cur.state || {}); const key=type==='evidence_ac'?'_evidenciasAC':'_evidenciasRiesgo';
+      if (!st[key] || typeof st[key] !== 'object' || Array.isArray(st[key])) st[key] = {};
+      const group=String((snap&&snap.groupKey)||'recuperadas'); if (!Array.isArray(st[key][group])) st[key][group]=[];
+      const item=sgrtPlainClone(snap&&snap.item||{}); const iid=String(item.id||row.ItemId||'');
+      st[key][group]=st[key][group].filter((x)=>String((x&&x.id)||'')!==iid); st[key][group].push(item);
+      st._deletedEvidenceIds=(Array.isArray(st._deletedEvidenceIds)?st._deletedEvidenceIds:[]).filter((x)=>String(x)!==iid);
+      await saveState(st,cur.exists);
+    } else if (type === 'risk') {
+      const cur=await loadState(); const st=hydrateEvaluatorResponses(cur.state||{}); const item=sgrtPlainClone(snap&&snap.item||snap||{}); const iid=String(item.id||row.ItemId||'');
+      const arr=Array.isArray(st._matrizRiesgos)?st._matrizRiesgos:[]; st._matrizRiesgos=arr.filter((x)=>String((x&&x.id)||'')!==iid); st._matrizRiesgos.push(item); await saveState(st,cur.exists);
+    } else if (type === 'document') {
+      const cur=await loadState(); const st=hydrateEvaluatorResponses(cur.state||{}); const item=sgrtPlainClone(snap&&snap.item||snap||{}); const iid=String(item.id||row.ItemId||'');
+      const arr=Array.isArray(st._documentosGenerados)?st._documentosGenerados:[]; st._documentosGenerados=arr.filter((x)=>String((x&&x.id)||'')!==iid); st._documentosGenerados.push(item); await saveState(st,cur.exists);
+    } else {
+      throw new Error('Tipo de recuperación no soportado: '+type);
+    }
+
+    const a=sgRecycleActor(actor); const ur=new sql.Request(tx);
+    ur.input('id',sql.BigInt,Number(id)); ur.input('login',sql.NVarChar(120),a.login||null); ur.input('name',sql.NVarChar(220),a.name||null);
+    await ur.query(`UPDATE dbo.SGRT_RecycleBin SET Status=N'Restored',RestoredAt=SYSUTCDATETIME(),RestoredByLogin=@login,RestoredByName=@name WHERE ID=@id`);
+    await tx.commit();
+    return {id:Number(id),entityType:type,nit,contractNo:contract,label:row.Label};
+  } catch (e) { try { await tx.rollback(); } catch (_) {} throw e; }
+}
+
+// Guarda cambios completos de otros roles sin destruir respuestas que un Evaluador
+// pudo haber sincronizado segundos antes. La fila se bloquea durante la mezcla para
+// que POST (otros roles) y PATCH (Evaluador) puedan convivir de forma segura.
+async function upsertSGRTStatePreservingEvaluator(nit, incomingPayload) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const readReq = new sql.Request(transaction);
+    readReq.input('nit', sql.NVarChar(50), String(nit));
+    const existingRs = await readReq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK, HOLDLOCK) WHERE NIT=@nit`);
+    let existing = {};
+    if (existingRs.recordset.length) {
+      try { existing = JSON.parse(existingRs.recordset[0].Payload || '{}'); } catch (e) { existing = {}; }
+    }
+    existing = hydrateEvaluatorResponses(existing);
+    let incoming = hydrateEvaluatorResponses(sgrtPlainClone(incomingPayload || {}));
+    incoming.nit = incoming.nit || String(nit);
+
+    // El estado entrante puede actualizar clasificación, contratos, tipologías,
+    // configuración, etc. Para cuestionarios, el servidor conserva la versión más
+    // reciente y solo incorpora contratos/preguntas que todavía no existan allí.
+    const serverAnswers = existing.respuestasACPorContrato || {};
+    const incomingAnswers = incoming.respuestasACPorContrato || {};
+    const mergedAnswers = sgrtPlainClone(incomingAnswers) || {};
+    Object.keys(serverAnswers).forEach((c) => {
+      const incomingKey = sgrtContractMapKey(mergedAnswers, c) || c;
+      const dst = mergedAnswers[incomingKey] && typeof mergedAnswers[incomingKey] === 'object' ? mergedAnswers[incomingKey] : {};
+      mergeEvaluatorAnswers(dst, serverAnswers[c]); // servidor gana si la misma pregunta difiere
+      mergedAnswers[incomingKey] = dst;
+    });
+    incoming.respuestasACPorContrato = mergedAnswers;
+
+    ['borradoresACPorContrato','acPorContrato'].forEach((block) => {
+      const a = incoming[block] && typeof incoming[block] === 'object' ? incoming[block] : {};
+      const e = existing[block] && typeof existing[block] === 'object' ? existing[block] : {};
+      Object.keys(e).forEach((c) => { if (!a[c]) a[c] = sgrtPlainClone(e[c]); });
+      incoming[block] = a;
+    });
+    if (existing._ultimaEdicionEvaluador) incoming._ultimaEdicionEvaluador = sgrtPlainClone(existing._ultimaEdicionEvaluador);
+
+    // Los bloques administrados por PATCH atómico conservan la versión del servidor
+    // frente a un POST completo potencialmente desactualizado de otro navegador.
+    ['dimsPorContrato','tipologiasPorContrato','promPorContrato','aprobadoPorContrato'].forEach((block) => {
+      const a = incoming[block] && typeof incoming[block] === 'object' ? incoming[block] : {};
+      const e = existing[block] && typeof existing[block] === 'object' ? existing[block] : {};
+      Object.keys(e).forEach((c) => { a[c] = sgrtPlainClone(e[c]); });
+      incoming[block] = a;
+    });
+    if (existing._ultimaEdicionClasificacion) incoming._ultimaEdicionClasificacion = sgrtPlainClone(existing._ultimaEdicionClasificacion);
+
+    // Evidencias y documentos se fusionan por ID/clave. Una sincronización completa
+    // de un navegador desactualizado no puede borrar lo subido por otro usuario ni
+    // revivir una evidencia eliminada explícitamente.
+    const deletedEvidence = new Set([...(Array.isArray(existing._deletedEvidenceIds)?existing._deletedEvidenceIds:[]), ...(Array.isArray(incoming._deletedEvidenceIds)?incoming._deletedEvidenceIds:[])].map(String));
+    const mergeEvidencePackPreserving = (a, e) => {
+      const out = sgrtPlainClone(a && typeof a === 'object' ? a : {}) || {};
+      Object.keys(e && typeof e === 'object' ? e : {}).forEach((key) => {
+        const src = Array.isArray(e[key]) ? e[key] : [];
+        const dst = Array.isArray(out[key]) ? out[key] : [];
+        const byId = {};
+        dst.concat(src).forEach((item) => {
+          if (!item) return;
+          const id = String(item.id || (item.name+'|'+item.size+'|'+item.contrato));
+          if (deletedEvidence.has(String(item.id || ''))) return;
+          byId[id] = sgrtPlainClone(item);
+        });
+        out[key] = Object.values(byId);
+      });
+      Object.keys(out).forEach((key) => { out[key] = (Array.isArray(out[key])?out[key]:[]).filter((item) => !deletedEvidence.has(String((item&&item.id)||''))); if (!out[key].length) delete out[key]; });
+      return out;
+    };
+    incoming._evidenciasAC = mergeEvidencePackPreserving(incoming._evidenciasAC, existing._evidenciasAC);
+    incoming._evidenciasRiesgo = mergeEvidencePackPreserving(incoming._evidenciasRiesgo, existing._evidenciasRiesgo);
+    incoming._deletedEvidenceIds = Array.from(deletedEvidence).slice(-500);
+    if (Array.isArray(existing._documentosGenerados)) {
+      const docs = {};
+      (Array.isArray(incoming._documentosGenerados)?incoming._documentosGenerados:[]).concat(existing._documentosGenerados).forEach((d) => { if (d&&d.id) docs[String(d.id)] = sgrtPlainClone(d); });
+      incoming._documentosGenerados = Object.values(docs);
+    }
+    if (existing._ultimaEdicionDocumentos) incoming._ultimaEdicionDocumentos = sgrtPlainClone(existing._ultimaEdicionDocumentos);
+
+    // Los riesgos también se administran de forma atómica. Un POST completo no puede
+    // borrar riesgos guardados por otro usuario segundos antes.
+    if (Array.isArray(existing._matrizRiesgos)) {
+      const by = {};
+      (Array.isArray(incoming._matrizRiesgos) ? incoming._matrizRiesgos : []).forEach((r) => {
+        const k = String((r && r.id) || '') + '|' + sgrtContractCanon(r && r.contrato);
+        if (k !== '|') by[k] = sgrtPlainClone(r);
+      });
+      existing._matrizRiesgos.forEach((r) => {
+        const k = String((r && r.id) || '') + '|' + sgrtContractCanon(r && r.contrato);
+        if (k !== '|') by[k] = sgrtPlainClone(r);
+      });
+      incoming._matrizRiesgos = Object.values(by);
+    }
+
+    const writeReq = new sql.Request(transaction);
+    writeReq.input('nit', sql.NVarChar(50), String(nit));
+    writeReq.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(incoming));
+    if (existingRs.recordset.length) {
+      await writeReq.query(`UPDATE dbo.SGRT_Tercero_Estado SET Payload=@payload, UpdatedAt=SYSUTCDATETIME() WHERE NIT=@nit`);
+    } else {
+      await writeReq.query(`INSERT INTO dbo.SGRT_Tercero_Estado (NIT, Payload, UpdatedAt) VALUES (@nit, @payload, SYSUTCDATETIME())`);
+    }
+    await transaction.commit();
+    return incoming;
+  } catch (error) {
+    try { await transaction.rollback(); } catch (e) {}
+    throw error;
+  }
+}
+
+async function getSGRTState(nit) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) return null;
+  const request = new sql.Request(pool);
+  request.input('nit', sql.NVarChar(50), String(nit));
+  const result = await request.query(`SELECT NIT, Payload, UpdatedAt FROM dbo.SGRT_Tercero_Estado WHERE NIT=@nit`);
+  if (!result.recordset.length) return null;
+  const row = result.recordset[0];
+  let payload = {};
+  try { payload = JSON.parse(row.Payload || '{}'); } catch (e) { payload = {}; }
+  payload = hydrateEvaluatorResponses(payload);
+  return { nit: row.NIT, estado_sgrt: payload, updatedAt: row.UpdatedAt };
+}
+
+
+
+// ================================================================
+// ACTUALIZACIÓN ATÓMICA DEL EVALUADOR POR CONTRATO
+// ================================================================
+// Evita que dos Evaluadores que trabajan al mismo tiempo reemplacen el JSON
+// completo del tercero. Solo se mezcla el bloque del contrato que se está
+// diligenciando y se bloquea la fila mientras dura la actualización.
+function sgrtPlainClone(value) {
+  try { return JSON.parse(JSON.stringify(value)); } catch (e) { return value; }
+}
+
+function sgrtContractCanon(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (/^\d+$/.test(s)) return String(parseInt(s, 10));
+  return s.toLowerCase();
+}
+
+function sgrtUsefulContractValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === 'object') return Object.keys(value).length > 0;
+  return !!value;
+}
+
+function sgrtContractMapKey(map, contract) {
+  if (!map || typeof map !== 'object') return '';
+  const raw = String(contract == null ? '' : contract).trim();
+  const hasExact = Object.prototype.hasOwnProperty.call(map, raw);
+  if (hasExact && sgrtUsefulContractValue(map[raw])) return raw;
+  const canon = sgrtContractCanon(raw);
+  let fallback = '';
+  Object.keys(map).some((key) => {
+    if (sgrtContractCanon(key) !== canon) return false;
+    if (sgrtUsefulContractValue(map[key])) { fallback = key; return true; }
+    if (!fallback) fallback = key;
+    return false;
+  });
+  return fallback || (hasExact ? raw : '');
+}
+
+function sgrtContractMapValue(map, contract) {
+  const key = sgrtContractMapKey(map, contract);
+  return key ? map[key] : undefined;
+}
+
+function mergeEvaluatorAnswers(target, source) {
+  target = target && typeof target === 'object' && !Array.isArray(target) ? target : {};
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return target;
+  Object.keys(source).forEach((tipKey) => {
+    const srcTip = source[tipKey];
+    if (!srcTip || typeof srcTip !== 'object' || Array.isArray(srcTip)) {
+      target[tipKey] = sgrtPlainClone(srcTip);
+      return;
+    }
+    if (!target[tipKey] || typeof target[tipKey] !== 'object' || Array.isArray(target[tipKey])) target[tipKey] = {};
+    Object.keys(srcTip).forEach((controlKey) => {
+      target[tipKey][controlKey] = sgrtPlainClone(srcTip[controlKey]);
+    });
+  });
+  return target;
+}
+
+function mergeEvaluatorPack(target, source) {
+  target = target && typeof target === 'object' && !Array.isArray(target) ? target : {};
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return target;
+  Object.keys(source).forEach((key) => { target[key] = sgrtPlainClone(source[key]); });
+  return target;
+}
+
+// Normaliza respuestas históricas para que todos los navegadores vean el mismo
+// progreso por contrato. Versiones antiguas guardaban el cuestionario en
+// _respuestas + contratoEval; las versiones actuales usan respuestasACPorContrato.
+function hydrateEvaluatorResponses(payload) {
+  payload = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  payload.respuestasACPorContrato = payload.respuestasACPorContrato && typeof payload.respuestasACPorContrato === 'object' ? payload.respuestasACPorContrato : {};
+
+  const absorb = (contract, source) => {
+    const c = String(contract || '').trim();
+    if (!c || !source || typeof source !== 'object' || Array.isArray(source)) return;
+    const dst = payload.respuestasACPorContrato[c] && typeof payload.respuestasACPorContrato[c] === 'object' ? payload.respuestasACPorContrato[c] : {};
+    mergeEvaluatorAnswers(dst, source);
+    payload.respuestasACPorContrato[c] = dst;
+  };
+
+  Object.keys(payload.acPorContrato || {}).forEach((c) => absorb(c, payload.acPorContrato[c] && payload.acPorContrato[c].respuestas));
+  Object.keys(payload.borradoresACPorContrato || {}).forEach((c) => absorb(c, payload.borradoresACPorContrato[c] && payload.borradoresACPorContrato[c].respuestas));
+  Object.keys(payload._respuestasPorContrato || {}).forEach((c) => absorb(c, payload._respuestasPorContrato[c]));
+  Object.keys(payload.respuestasPorContrato || {}).forEach((c) => absorb(c, payload.respuestasPorContrato[c]));
+
+  // _respuestas es un formato legado global. Si ya existen respuestas separadas por
+  // contrato NO se vuelve a inferir su dueño desde contratoEval, porque contratoEval
+  // cambia al navegar y eso duplicaba el mismo progreso en contratos distintos.
+  const hasContractAnswers = Object.keys(payload.respuestasACPorContrato || {}).some((c) => {
+    const block = payload.respuestasACPorContrato[c];
+    return block && typeof block === 'object' && Object.keys(block).length > 0;
+  });
+  const legacyContract = String(
+    payload._respuestasContrato ||
+    payload.contratoRespuestas ||
+    ''
+  ).trim();
+  // Nunca se infiere el dueño del bloque global desde contratoEval/última pantalla.
+  // Y si ya existen bloques por contrato, el global se ignora para no replicar respuestas.
+  if (!hasContractAnswers && legacyContract && payload._respuestas && typeof payload._respuestas === 'object') absorb(legacyContract, payload._respuestas);
+  return payload;
+}
+
+async function patchEvaluatorStateByContract(nit, contrato, patch) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+  if ((patch && patch.clearContract === true) || (patch && Array.isArray(patch.deleteEvidenceIds) && patch.deleteEvidenceIds.length)) await ensureSGRTRecycleTable();
+
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const readReq = new sql.Request(transaction);
+    readReq.input('nit', sql.NVarChar(50), String(nit));
+    const existing = await readReq.query(`
+      SELECT NIT, Payload, UpdatedAt
+      FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK, HOLDLOCK)
+      WHERE NIT=@nit
+    `);
+
+    let payload = {};
+    if (existing.recordset.length) {
+      try { payload = JSON.parse(existing.recordset[0].Payload || '{}'); } catch (e) { payload = {}; }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    payload = hydrateEvaluatorResponses(payload);
+
+    const c = String(contrato || '').trim();
+    payload.nit = payload.nit || String(nit);
+    payload.respuestasACPorContrato = payload.respuestasACPorContrato && typeof payload.respuestasACPorContrato === 'object' ? payload.respuestasACPorContrato : {};
+    payload.borradoresACPorContrato = payload.borradoresACPorContrato && typeof payload.borradoresACPorContrato === 'object' ? payload.borradoresACPorContrato : {};
+    payload.acPorContrato = payload.acPorContrato && typeof payload.acPorContrato === 'object' ? payload.acPorContrato : {};
+    payload.promPorContrato = payload.promPorContrato && typeof payload.promPorContrato === 'object' ? payload.promPorContrato : {};
+
+    const deleteContractAliases = (map) => {
+      if (!map || typeof map !== 'object') return;
+      Object.keys(map).forEach((key) => { if (sgrtContractCanon(key) === sgrtContractCanon(c)) delete map[key]; });
+    };
+
+    if (patch && patch.clearContract === true) {
+      try {
+        const blocks = {};
+        ['respuestasACPorContrato','borradoresACPorContrato','acPorContrato','promPorContrato','respuestasPorContrato','_respuestasPorContrato'].forEach((b) => {
+          const v = sgrtContractMapValue(payload[b], c);
+          if (v !== undefined && v !== null && (typeof v !== 'object' || Object.keys(v).length)) blocks[b] = sgrtPlainClone(v);
+        });
+        if (payload._respuestasContrato && sgrtContractCanon(payload._respuestasContrato) === sgrtContractCanon(c) && payload._respuestas && Object.keys(payload._respuestas).length) blocks._respuestas = sgrtPlainClone(payload._respuestas);
+        if (Object.keys(blocks).length) await sgRecycleInsert({entityType:'contract_evaluator',nit:String(nit),contractNo:c,itemId:c,label:'Respuestas Ambiente de Control · contrato '+c,payload:{contract:c,blocks}}, patch.actor || {}, transaction);
+      } catch (e) { console.warn('⚠️ No se pudo guardar copia recuperable del contrato:', e.message); }
+      deleteContractAliases(payload.respuestasACPorContrato);
+      deleteContractAliases(payload.borradoresACPorContrato);
+      deleteContractAliases(payload.acPorContrato);
+      deleteContractAliases(payload.promPorContrato);
+      deleteContractAliases(payload._respuestasPorContrato);
+      deleteContractAliases(payload.respuestasPorContrato);
+      payload.respuestasACPorContrato[c] = {};
+      payload._respuestasContrato = c;
+      payload._respuestas = {};
+    }
+
+    const previousAnswerKey = sgrtContractMapKey(payload.respuestasACPorContrato, c);
+    if (patch && patch.replaceResponses === true && patch.respuestas && typeof patch.respuestas === 'object') {
+      payload.respuestasACPorContrato[c] = sgrtPlainClone(patch.respuestas);
+    } else {
+      const previousAnswers = sgrtContractMapValue(payload.respuestasACPorContrato, c);
+      const currentAnswers = previousAnswers && typeof previousAnswers === 'object' ? sgrtPlainClone(previousAnswers) : {};
+      if (patch && patch.respuestas && typeof patch.respuestas === 'object') mergeEvaluatorAnswers(currentAnswers, patch.respuestas);
+      if (patch && patch.respuestaDelta && typeof patch.respuestaDelta === 'object') mergeEvaluatorAnswers(currentAnswers, patch.respuestaDelta);
+      payload.respuestasACPorContrato[c] = currentAnswers;
+    }
+    // "04" y "4" son el mismo contrato histórico. Al guardar, consolidamos en la
+    // etiqueta usada actualmente para que no queden dos bloques que luego compitan.
+    if (previousAnswerKey && previousAnswerKey !== c && sgrtContractCanon(previousAnswerKey) === sgrtContractCanon(c)) {
+      delete payload.respuestasACPorContrato[previousAnswerKey];
+    }
+
+    // Compatibilidad con módulos antiguos sin perder separación contractual: el bloque
+    // global siempre apunta explícitamente al último contrato editado.
+    payload._respuestasContrato = c;
+    payload._respuestas = sgrtPlainClone(payload.respuestasACPorContrato[c] || {});
+
+    if (!(patch && patch.clearContract === true) && patch && patch.borrador && typeof patch.borrador === 'object') {
+      const b = sgrtPlainClone(patch.borrador);
+      b.contrato = c;
+      b.respuestas = sgrtPlainClone(payload.respuestasACPorContrato[c] || {});
+      payload.borradoresACPorContrato[c] = b;
+    }
+    if (!(patch && patch.clearContract === true) && patch && patch.ac && typeof patch.ac === 'object') {
+      const ac = sgrtPlainClone(patch.ac);
+      ac.respuestas = sgrtPlainClone(payload.respuestasACPorContrato[c] || {});
+      payload.acPorContrato[c] = ac;
+    }
+    if (!(patch && patch.clearContract === true) && patch && patch.promContrato && typeof patch.promContrato === 'object') {
+      const oldPromKey = sgrtContractMapKey(payload.promPorContrato, c);
+      payload.promPorContrato[c] = Object.assign({}, sgrtContractMapValue(payload.promPorContrato, c) || {}, sgrtPlainClone(patch.promContrato));
+      if (oldPromKey && oldPromKey !== c && sgrtContractCanon(oldPromKey) === sgrtContractCanon(c)) delete payload.promPorContrato[oldPromKey];
+    }
+    if (patch && patch.evidenciasAC && typeof patch.evidenciasAC === 'object') {
+      payload._evidenciasAC = mergeEvaluatorPack(payload._evidenciasAC, patch.evidenciasAC);
+    }
+    if (patch && patch.evidenciasRiesgo && typeof patch.evidenciasRiesgo === 'object') {
+      payload._evidenciasRiesgo = mergeEvaluatorPack(payload._evidenciasRiesgo, patch.evidenciasRiesgo);
+    }
+    const evidenceTombstones = new Set((Array.isArray(payload._deletedEvidenceIds) ? payload._deletedEvidenceIds : []).map(String));
+    const filterTombstones = (pack) => {
+      if (!pack || typeof pack !== 'object' || Array.isArray(pack)) return pack || {};
+      Object.keys(pack).forEach((key) => { if (Array.isArray(pack[key])) pack[key] = pack[key].filter((item) => !evidenceTombstones.has(String((item&&item.id)||''))); });
+      return pack;
+    };
+    payload._evidenciasAC = filterTombstones(payload._evidenciasAC);
+    payload._evidenciasRiesgo = filterTombstones(payload._evidenciasRiesgo);
+
+    // Bajas explícitas de evidencias. Antes el navegador quitaba la tarjeta, pero
+    // el servidor conservaba el metadato y la evidencia reaparecía al recargar.
+    // Se elimina únicamente el id solicitado, sin tocar evidencias de otros
+    // contratos, tipologías o terceros.
+    if (patch && Array.isArray(patch.deleteEvidenceIds) && patch.deleteEvidenceIds.length) {
+      const deleteIds = new Set(patch.deleteEvidenceIds.map((x) => String(x || '').trim()).filter(Boolean));
+      try {
+        for (const spec of [{key:'_evidenciasAC',type:'evidence_ac'},{key:'_evidenciasRiesgo',type:'evidence_risk'}]) {
+          const pack=payload[spec.key] && typeof payload[spec.key]==='object' ? payload[spec.key] : {};
+          for (const groupKey of Object.keys(pack)) {
+            const arr=Array.isArray(pack[groupKey])?pack[groupKey]:[];
+            for (const item of arr) {
+              const iid=String((item&&item.id)||'');
+              if (deleteIds.has(iid)) await sgRecycleInsert({entityType:spec.type,nit:String(nit),contractNo:String((item&&item.contrato)||c),itemId:iid,label:'Evidencia · '+String((item&&item.name)||iid),payload:{groupKey,item:sgrtPlainClone(item)}}, patch.actor || {}, transaction);
+            }
+          }
+        }
+      } catch (e) { console.warn('⚠️ No se pudo guardar copia recuperable de evidencia:', e.message); }
+      const tombstones = new Set((Array.isArray(payload._deletedEvidenceIds) ? payload._deletedEvidenceIds : []).map(String));
+      deleteIds.forEach((id) => tombstones.add(id));
+      payload._deletedEvidenceIds = Array.from(tombstones).slice(-500);
+      const prunePack = (pack) => {
+        if (!pack || typeof pack !== 'object' || Array.isArray(pack)) return pack || {};
+        const out = {};
+        Object.keys(pack).forEach((key) => {
+          const val = pack[key];
+          if (Array.isArray(val)) {
+            const filtered = val.filter((item) => !deleteIds.has(String((item && item.id) || '').trim()));
+            if (filtered.length) out[key] = filtered;
+          } else if (val && typeof val === 'object') {
+            const copy = {};
+            Object.keys(val).forEach((k2) => {
+              const v2 = val[k2];
+              if (Array.isArray(v2)) {
+                const f2 = v2.filter((item) => !deleteIds.has(String((item && item.id) || '').trim()));
+                if (f2.length) copy[k2] = f2;
+              } else if (!deleteIds.has(String((v2 && v2.id) || '').trim())) copy[k2] = v2;
+            });
+            if (Object.keys(copy).length) out[key] = copy;
+          } else out[key] = val;
+        });
+        return out;
+      };
+      payload._evidenciasAC = prunePack(payload._evidenciasAC);
+      payload._evidenciasRiesgo = prunePack(payload._evidenciasRiesgo);
+    }
+
+    const actor = patch && patch.actor && typeof patch.actor === 'object' ? patch.actor : {};
+    payload._ultimaEdicionEvaluador = {
+      contrato: c,
+      at: new Date().toISOString(),
+      usuario: {
+        login: String(actor.login || actor.user || '').slice(0, 120),
+        nombre: String(actor.name || actor.nombre || '').slice(0, 180),
+        rol: String(actor.rol || '').slice(0, 80)
+      }
+    };
+
+    const writeReq = new sql.Request(transaction);
+    writeReq.input('nit', sql.NVarChar(50), String(nit));
+    writeReq.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(payload));
+    if (existing.recordset.length) {
+      await writeReq.query(`UPDATE dbo.SGRT_Tercero_Estado SET Payload=@payload, UpdatedAt=SYSUTCDATETIME() WHERE NIT=@nit`);
+    } else {
+      await writeReq.query(`INSERT INTO dbo.SGRT_Tercero_Estado (NIT, Payload, UpdatedAt) VALUES (@nit, @payload, SYSUTCDATETIME())`);
+    }
+    await transaction.commit();
+    return payload;
+  } catch (error) {
+    try { await transaction.rollback(); } catch (e) {}
+    throw error;
+  }
+}
+
+
+// PATCH específico del Administrador de Riesgos: actualiza únicamente la
+// clasificación/tipologías del contrato indicado. Usa bloqueo de fila para
+// evitar que dos usuarios trabajando al mismo tiempo se pisen otros contratos.
+async function patchClassificationStateByContract(nit, contrato, patch) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const readReq = new sql.Request(transaction);
+    readReq.input('nit', sql.NVarChar(50), String(nit));
+    const existing = await readReq.query(`
+      SELECT NIT, Payload, UpdatedAt
+      FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK, HOLDLOCK)
+      WHERE NIT=@nit
+    `);
+
+    let payload = {};
+    if (existing.recordset.length) {
+      try { payload = JSON.parse(existing.recordset[0].Payload || '{}'); } catch (e) { payload = {}; }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    payload = hydrateEvaluatorResponses(payload);
+
+    const c = String(contrato || '').trim();
+    const consolidate = (map, value) => {
+      map = map && typeof map === 'object' && !Array.isArray(map) ? map : {};
+      const oldKey = sgrtContractMapKey(map, c);
+      map[c] = sgrtPlainClone(value);
+      if (oldKey && oldKey !== c && sgrtContractCanon(oldKey) === sgrtContractCanon(c)) delete map[oldKey];
+      return map;
+    };
+
+    payload.nit = payload.nit || String(nit);
+    payload.dimsPorContrato = payload.dimsPorContrato && typeof payload.dimsPorContrato === 'object' ? payload.dimsPorContrato : {};
+    payload.tipologiasPorContrato = payload.tipologiasPorContrato && typeof payload.tipologiasPorContrato === 'object' ? payload.tipologiasPorContrato : {};
+    payload.promPorContrato = payload.promPorContrato && typeof payload.promPorContrato === 'object' ? payload.promPorContrato : {};
+    payload.aprobadoPorContrato = payload.aprobadoPorContrato && typeof payload.aprobadoPorContrato === 'object' ? payload.aprobadoPorContrato : {};
+
+    const dims = patch && Array.isArray(patch.dims) ? patch.dims : [];
+    payload.dimsPorContrato = consolidate(payload.dimsPorContrato, dims);
+    payload.tipologiasPorContrato = consolidate(payload.tipologiasPorContrato, dims);
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'promContrato')) {
+      const prom = patch.promContrato && typeof patch.promContrato === 'object'
+        ? patch.promContrato
+        : {prom:null,zona:'',sinPuntaje:true};
+      payload.promPorContrato = consolidate(payload.promPorContrato, prom);
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'aprobado')) {
+      const oldKey = sgrtContractMapKey(payload.aprobadoPorContrato, c);
+      payload.aprobadoPorContrato[c] = !!patch.aprobado;
+      if (oldKey && oldKey !== c && sgrtContractCanon(oldKey) === sgrtContractCanon(c)) delete payload.aprobadoPorContrato[oldKey];
+    }
+
+    if (!Array.isArray(payload.contratos)) payload.contratos = [];
+    if (patch && patch.contratoMeta && typeof patch.contratoMeta === 'object') {
+      const meta = sgrtPlainClone(patch.contratoMeta);
+      meta.num = String(meta.num || meta.numero || meta.NoContrato || c).trim() || c;
+      meta.numero = meta.num;
+      const idx = payload.contratos.findIndex((x) =>
+        sgrtContractCanon(x && (x.num || x.numero || x.NoContrato || x.noContrato || x.contrato)) === sgrtContractCanon(c)
+      );
+      if (idx >= 0) payload.contratos[idx] = Object.assign({}, payload.contratos[idx] || {}, meta);
+      else payload.contratos.push(meta);
+    }
+
+    ['nombre','entidad','domicilio','servicio','servicio_contratado'].forEach((k) => {
+      if (patch && patch[k] !== undefined && String(patch[k] == null ? '' : patch[k]).trim()) payload[k] = patch[k];
+    });
+
+    payload.modoEval = 'contrato';
+    payload.contratoEval = c;
+    payload.dims = sgrtPlainClone(dims);
+    payload.savedAt = new Date().toISOString();
+    payload._ultimaEdicionClasificacion = {
+      contrato: c,
+      at: new Date().toISOString(),
+      usuario: patch && patch.actor && typeof patch.actor === 'object'
+        ? {
+            login: String(patch.actor.login || patch.actor.user || '').slice(0,120),
+            nombre: String(patch.actor.name || patch.actor.nombre || '').slice(0,180),
+            rol: String(patch.actor.rol || '').slice(0,80)
+          }
+        : {}
+    };
+
+    const writeReq = new sql.Request(transaction);
+    writeReq.input('nit', sql.NVarChar(50), String(nit));
+    writeReq.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(payload));
+    if (existing.recordset.length) {
+      await writeReq.query(`UPDATE dbo.SGRT_Tercero_Estado SET Payload=@payload, UpdatedAt=SYSUTCDATETIME() WHERE NIT=@nit`);
+    } else {
+      await writeReq.query(`INSERT INTO dbo.SGRT_Tercero_Estado (NIT, Payload, UpdatedAt) VALUES (@nit, @payload, SYSUTCDATETIME())`);
+    }
+    await transaction.commit();
+    return payload;
+  } catch (error) {
+    try { await transaction.rollback(); } catch (e) {}
+    throw error;
+  }
+}
+
+
+// Riesgos por tercero: mezcla altas/ediciones y bajas explícitas bajo el mismo
+// bloqueo de fila. Así dos usuarios no reemplazan toda la matriz del otro.
+async function patchRiskState(nit, patch) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+  if (patch && Array.isArray(patch.deleteIds) && patch.deleteIds.length) await ensureSGRTRecycleTable();
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const readReq = new sql.Request(transaction);
+    readReq.input('nit', sql.NVarChar(50), String(nit));
+    const existing = await readReq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK, HOLDLOCK) WHERE NIT=@nit`);
+    let payload = {};
+    if (existing.recordset.length) {
+      try { payload = JSON.parse(existing.recordset[0].Payload || '{}'); } catch (e) { payload = {}; }
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    payload = hydrateEvaluatorResponses(payload);
+
+    const by = {};
+    (Array.isArray(payload._matrizRiesgos) ? payload._matrizRiesgos : []).forEach((r) => {
+      const k = String((r && r.id) || '') + '|' + sgrtContractCanon(r && r.contrato);
+      if (k !== '|') by[k] = sgrtPlainClone(r);
+    });
+    (Array.isArray(patch && patch.upserts) ? patch.upserts : []).forEach((r) => {
+      const x = sgrtPlainClone(r || {});
+      x.nit = x.nit || String(nit);
+      const k = String(x.id || '') + '|' + sgrtContractCanon(x.contrato);
+      if (k !== '|') by[k] = x;
+    });
+    const deletes = Array.isArray(patch && patch.deleteIds) ? patch.deleteIds.map(String) : [];
+    if (deletes.length) {
+      try {
+        for (const k of Object.keys(by)) {
+          const item=by[k], iid=String((item&&item.id)||'');
+          if (deletes.indexOf(iid)>=0) await sgRecycleInsert({entityType:'risk',nit:String(nit),contractNo:String((item&&item.contrato)||''),itemId:iid,label:'Riesgo · '+String((item&&(item.desc||item.riesgo||item.nombre))||iid),payload:{item:sgrtPlainClone(item)}}, patch.actor || {}, transaction);
+        }
+      } catch (e) { console.warn('⚠️ No se pudo guardar copia recuperable de riesgo:', e.message); }
+      Object.keys(by).forEach((k) => {
+        if (deletes.indexOf(String((by[k] && by[k].id) || '')) >= 0) delete by[k];
+      });
+    }
+    payload._matrizRiesgos = Object.values(by);
+    payload.savedAt = new Date().toISOString();
+    payload._ultimaEdicionRiesgos = {at:new Date().toISOString(), usuario:sgrtPlainClone((patch && patch.actor) || {})};
+
+    const writeReq = new sql.Request(transaction);
+    writeReq.input('nit', sql.NVarChar(50), String(nit));
+    writeReq.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(payload));
+    if (existing.recordset.length) await writeReq.query(`UPDATE dbo.SGRT_Tercero_Estado SET Payload=@payload, UpdatedAt=SYSUTCDATETIME() WHERE NIT=@nit`);
+    else await writeReq.query(`INSERT INTO dbo.SGRT_Tercero_Estado (NIT, Payload, UpdatedAt) VALUES (@nit, @payload, SYSUTCDATETIME())`);
+    await transaction.commit();
+    return payload;
+  } catch (error) {
+    try { await transaction.rollback(); } catch (e) {}
+    throw error;
+  }
+}
+
+// Documentos generados por el asistente/reportes. Se guardan dentro del estado
+// del tercero para que sean visibles desde otros equipos/enlaces que consumen el
+// mismo backend. Los binarios pequeños viajan como data URL; para archivos grandes
+// se conserva al menos el metadato y el usuario puede volver a generarlos.
+async function patchGeneratedDocuments(nit, patch) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+  if (patch && Array.isArray(patch.deleteIds) && patch.deleteIds.length) await ensureSGRTRecycleTable();
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const readReq = new sql.Request(transaction);
+    readReq.input('nit', sql.NVarChar(50), String(nit));
+    const existing = await readReq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK, HOLDLOCK) WHERE NIT=@nit`);
+    let payload = {};
+    if (existing.recordset.length) { try { payload = JSON.parse(existing.recordset[0].Payload || '{}'); } catch (e) { payload = {}; } }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) payload = {};
+    payload = hydrateEvaluatorResponses(payload);
+    const byId = {};
+    (Array.isArray(payload._documentosGenerados) ? payload._documentosGenerados : []).forEach((d) => {
+      if (d && d.id) byId[String(d.id)] = sgrtPlainClone(d);
+    });
+    (Array.isArray(patch && patch.upserts) ? patch.upserts : []).forEach((d) => {
+      if (!d || !d.id) return;
+      const x = sgrtPlainClone(d);
+      x.nit = x.nit || String(nit);
+      // Protección para no inflar indefinidamente el JSON del estado.
+      if (x.dataUrl && String(x.dataUrl).length > 8 * 1024 * 1024) delete x.dataUrl;
+      byId[String(x.id)] = x;
+    });
+    const deletes = new Set((Array.isArray(patch && patch.deleteIds) ? patch.deleteIds : []).map(String));
+    if (deletes.size) {
+      try {
+        for (const id of Object.keys(byId)) if (deletes.has(id)) {
+          const item=byId[id]; await sgRecycleInsert({entityType:'document',nit:String(nit),contractNo:String((item&&item.contrato)||''),itemId:id,label:'Documento · '+String((item&&(item.name||item.nombre||item.fileName))||id),payload:{item:sgrtPlainClone(item)}}, patch.actor || {}, transaction);
+        }
+      } catch (e) { console.warn('⚠️ No se pudo guardar copia recuperable de documento:', e.message); }
+    }
+    Object.keys(byId).forEach((id) => { if (deletes.has(id)) delete byId[id]; });
+    payload._documentosGenerados = Object.values(byId);
+    payload._ultimaEdicionDocumentos = {at:new Date().toISOString(), usuario:sgrtPlainClone((patch && patch.actor) || {})};
+    const writeReq = new sql.Request(transaction);
+    writeReq.input('nit', sql.NVarChar(50), String(nit));
+    writeReq.input('payload', sql.NVarChar(sql.MAX), JSON.stringify(payload));
+    if (existing.recordset.length) await writeReq.query(`UPDATE dbo.SGRT_Tercero_Estado SET Payload=@payload, UpdatedAt=SYSUTCDATETIME() WHERE NIT=@nit`);
+    else await writeReq.query(`INSERT INTO dbo.SGRT_Tercero_Estado (NIT, Payload, UpdatedAt) VALUES (@nit, @payload, SYSUTCDATETIME())`);
+    await transaction.commit();
+    return payload;
+  } catch (error) {
+    try { await transaction.rollback(); } catch (e) {}
+    throw error;
+  }
+}
+
+// ================================================================
+// MAESTRO DE ENTIDADES / ORGANIZACIONES SGRT
+// ================================================================
+let sgrtEntitiesReady = false;
+
+async function ensureSGRTEntitiesTable() {
+  if (!pool || !pool.connected) return false;
+  try {
+    await new sql.Request(pool).query(`
+      IF OBJECT_ID('dbo.SGRT_Entidades', 'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.SGRT_Entidades (
+          Entidad_ID NVARCHAR(120) NOT NULL PRIMARY KEY,
+          Nombre NVARCHAR(250) NOT NULL,
+          Acronimo NVARCHAR(50) NULL,
+          Estado NVARCHAR(30) NOT NULL CONSTRAINT DF_SGRT_Entidades_Estado DEFAULT N'Activo',
+          FechaCreacion DATETIME2 NOT NULL CONSTRAINT DF_SGRT_Entidades_Fecha DEFAULT SYSUTCDATETIME(),
+          UpdatedAt DATETIME2 NOT NULL CONSTRAINT DF_SGRT_Entidades_Updated DEFAULT SYSUTCDATETIME()
+        );
+      END
+    `);
+    sgrtEntitiesReady = true;
+    return true;
+  } catch (e) {
+    sgrtEntitiesReady = false;
+    console.warn('⚠️ No se pudo crear/verificar dbo.SGRT_Entidades:', e.message);
+    return false;
+  }
+}
+
+async function upsertEntidadSGRT(ent) {
+  if (!sgrtEntitiesReady) await ensureSGRTEntitiesTable();
+  if (!sgrtEntitiesReady) throw new Error('dbo.SGRT_Entidades no disponible');
+  const id = String(ent.id || ent.Entidad_ID || '').trim();
+  const nombre = String(ent.nombre || ent.Nombre || id).trim();
+  const acronimo = String(ent.acronimo || ent.Acronimo || '').trim();
+  const estado = String(ent.estado || ent.Estado || 'Activo').trim() || 'Activo';
+  if (!id || !nombre) throw new Error('Entidad_ID y Nombre son obligatorios');
+  const rq = new sql.Request(pool);
+  rq.input('id', sql.NVarChar(120), id);
+  rq.input('nombre', sql.NVarChar(250), nombre);
+  rq.input('acronimo', sql.NVarChar(50), acronimo || null);
+  rq.input('estado', sql.NVarChar(30), estado);
+  await rq.query(`
+    MERGE dbo.SGRT_Entidades AS target
+    USING (SELECT @id AS Entidad_ID) src ON target.Entidad_ID = src.Entidad_ID
+    WHEN MATCHED THEN UPDATE SET Nombre=@nombre, Acronimo=@acronimo, Estado=@estado, UpdatedAt=SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN INSERT (Entidad_ID,Nombre,Acronimo,Estado,FechaCreacion,UpdatedAt)
+      VALUES (@id,@nombre,@acronimo,@estado,SYSUTCDATETIME(),SYSUTCDATETIME());
+  `);
+}
+
+
+// ================================================================
+// ACTIVIDAD / TELEMETRÍA OPERATIVA SGRT
+// ================================================================
+// Se usa para medir sesiones, solicitudes y tráfico estimado por usuario.
+// No pretende atribuir CPU/RAM exactos a un usuario (eso requeriría APM
+// distribuido); la RAM y uptime se reportan a nivel global del servidor.
+let sgrtActivityReady = false;
+
+async function ensureSGRTActivityTable() {
+  if (!pool || !pool.connected) return false;
+  try {
+    await new sql.Request(pool).query(`
+      IF OBJECT_ID('dbo.SGRT_Activity', 'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.SGRT_Activity (
+          ID BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+          CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_SGRT_Activity_CreatedAt DEFAULT SYSUTCDATETIME(),
+          EventType NVARCHAR(60) NOT NULL,
+          UserLogin NVARCHAR(120) NULL,
+          UserName NVARCHAR(220) NULL,
+          UserRole NVARCHAR(140) NULL,
+          EntityId NVARCHAR(140) NULL,
+          SessionId NVARCHAR(120) NULL,
+          ModuleId NVARCHAR(180) NULL,
+          Route NVARCHAR(350) NULL,
+          Method NVARCHAR(16) NULL,
+          NIT NVARCHAR(80) NULL,
+          ContractNo NVARCHAR(140) NULL,
+          Message NVARCHAR(1200) NULL,
+          BytesIn BIGINT NOT NULL CONSTRAINT DF_SGRT_Activity_BytesIn DEFAULT 0,
+          BytesOut BIGINT NOT NULL CONSTRAINT DF_SGRT_Activity_BytesOut DEFAULT 0,
+          Meta NVARCHAR(MAX) NULL
+        );
+        CREATE INDEX IX_SGRT_Activity_CreatedAt ON dbo.SGRT_Activity(CreatedAt DESC);
+        CREATE INDEX IX_SGRT_Activity_UserLogin ON dbo.SGRT_Activity(UserLogin, CreatedAt DESC);
+      END
+    `);
+    sgrtActivityReady = true;
+    console.log('✅ Tabla de actividad SGRT disponible: dbo.SGRT_Activity');
+    return true;
+  } catch (e) {
+    sgrtActivityReady = false;
+    console.warn('⚠️ No se pudo crear/verificar dbo.SGRT_Activity:', e.message);
+    return false;
+  }
+}
+
+function sgTrim(value, max) {
+  const text = String(value == null ? '' : value).trim();
+  return max ? text.slice(0, max) : text;
+}
+
+function sgDecodeHeader(value) {
+  const text = sgTrim(value, 800);
+  if (!text) return '';
+  try { return decodeURIComponent(text); } catch (e) { return text; }
+}
+
+async function sgLogActivity(event) {
+  if (!pool || !pool.connected) return false;
+  if (!sgrtActivityReady) await ensureSGRTActivityTable();
+  if (!sgrtActivityReady) return false;
+  try {
+    const e = event || {};
+    const rq = new sql.Request(pool);
+    rq.input('eventType', sql.NVarChar(60), sgTrim(e.eventType || 'evento', 60));
+    rq.input('userLogin', sql.NVarChar(120), sgTrim(e.userLogin, 120) || null);
+    rq.input('userName', sql.NVarChar(220), sgTrim(e.userName, 220) || null);
+    rq.input('userRole', sql.NVarChar(140), sgTrim(e.userRole, 140) || null);
+    rq.input('entityId', sql.NVarChar(140), sgTrim(e.entityId, 140) || null);
+    rq.input('sessionId', sql.NVarChar(120), sgTrim(e.sessionId, 120) || null);
+    rq.input('moduleId', sql.NVarChar(180), sgTrim(e.moduleId, 180) || null);
+    rq.input('route', sql.NVarChar(350), sgTrim(e.route, 350) || null);
+    rq.input('method', sql.NVarChar(16), sgTrim(e.method, 16) || null);
+    rq.input('nit', sql.NVarChar(80), sgTrim(e.nit, 80) || null);
+    rq.input('contractNo', sql.NVarChar(140), sgTrim(e.contractNo, 140) || null);
+    rq.input('message', sql.NVarChar(1200), sgTrim(e.message, 1200) || null);
+    rq.input('bytesIn', sql.BigInt, Math.max(0, Number(e.bytesIn || 0) || 0));
+    rq.input('bytesOut', sql.BigInt, Math.max(0, Number(e.bytesOut || 0) || 0));
+    let meta = null;
+    try { meta = e.meta == null ? null : JSON.stringify(e.meta).slice(0, 1000000); } catch (x) { meta = null; }
+    rq.input('meta', sql.NVarChar(sql.MAX), meta);
+    await rq.query(`
+      INSERT INTO dbo.SGRT_Activity
+      (EventType,UserLogin,UserName,UserRole,EntityId,SessionId,ModuleId,Route,Method,NIT,ContractNo,Message,BytesIn,BytesOut,Meta)
+      VALUES
+      (@eventType,@userLogin,@userName,@userRole,@entityId,@sessionId,@moduleId,@route,@method,@nit,@contractNo,@message,@bytesIn,@bytesOut,@meta)
+    `);
+    return true;
+  } catch (e) {
+    console.warn('⚠️ Actividad SGRT no registrada:', e.message);
+    return false;
+  }
+}
+
+function sgActorFromRequest(req) {
+  return {
+    userLogin: sgDecodeHeader(req.headers['x-sgrt-user']),
+    userName: sgDecodeHeader(req.headers['x-sgrt-name']),
+    userRole: sgDecodeHeader(req.headers['x-sgrt-role']),
+    entityId: sgDecodeHeader(req.headers['x-sgrt-entity']),
+    sessionId: sgDecodeHeader(req.headers['x-sgrt-session']),
+    moduleId: sgDecodeHeader(req.headers['x-sgrt-module'])
+  };
+}
+
+// ================================================================
+// CONEXIÓN
+// ================================================================
+
+async function initializeDatabase() {
+
+  try {
+
+    console.log('');
+    console.log('==============================================');
+    console.log('🔄 CONECTANDO A AZURE SQL');
+    console.log('==============================================');
+
+    console.log(`Servidor: ${config.server}`);
+
+    console.log(`Base de datos: ${config.database}`);
+
+    console.log(
+      'Autenticación: Microsoft Entra ID / Managed Identity'
+    );
+
+    config = await buildSqlConnectionConfig();
+
+    pool = new sql.ConnectionPool(config);
+
+    pool.on('error', error => {
+
+      console.error(
+        '❌ Error en pool SQL:',
+        error.message
+      );
+
+    });
+
+    await pool.connect();
+    await ensureSGRTStateTable();
+    await ensureSGRTEntitiesTable();
+    await ensureSGRTActivityTable();
+    await ensureSGRTRecycleTable();
+
+    console.log('');
+    console.log('✅ CONEXIÓN EXITOSA');
+    console.log(`📍 ${config.server}`);
+    console.log(`🗄️ ${config.database}`);
+    console.log('');
+
+    return true;
+
+  } catch (error) {
+
+    console.error('');
+    console.error('❌ ERROR DE CONEXIÓN A AZURE SQL');
+    console.error('Mensaje:', error.message);
+    console.error('Código:', error.code || 'N/A');
+
+    console.error('');
+    console.error('Verificar:');
+
+    console.error(
+      'DB_SERVER:',
+      process.env.DB_SERVER || 'NO CONFIGURADO'
+    );
+
+    console.error(
+      'DB_DATABASE / DB_NAME:',
+      process.env.DB_DATABASE || process.env.DB_NAME || 'NO CONFIGURADO'
+    );
+
+    console.error(
+      'Managed Identity del App Service'
+    );
+
+    console.error(
+      'Permisos de la identidad en Azure SQL'
+    );
+
+    console.error(
+      'Firewall de Azure SQL'
+    );
+
+    return false;
+  }
+}
+
+
+// ================================================================
+// TELEMETRÍA, ACTIVIDAD Y BORRADO SELECTIVO SEGURO
+// ================================================================
+
+// Registra el consumo estimado de las APIs por usuario. Se excluyen los propios
+// endpoints de telemetría para evitar bucles.
+app.use('/api', (req, res, next) => {
+  const rel = String(req.path || req.url || '');
+  if (/^\/(?:telemetry|activity)(?:\/|$)/i.test(rel)) return next();
+  const started = Date.now();
+  const actor = sgActorFromRequest(req);
+  const bytesIn = Number(req.headers['content-length'] || 0) || 0;
+  res.on('finish', () => {
+    const bytesOut = Number(res.getHeader('content-length') || 0) || 0;
+    const cleanRoute = '/api' + rel.split('?')[0];
+    const durationMs = Date.now() - started;
+    sgLogActivity({
+      ...actor,
+      eventType: 'api_request',
+      route: cleanRoute,
+      method: req.method,
+      bytesIn,
+      bytesOut,
+      message: `${req.method} ${cleanRoute} · ${res.statusCode}`,
+      meta: { status: res.statusCode, durationMs }
+    }).catch(() => {});
+
+    // Los cambios confirmados se registran además como actividad funcional para
+    // que otros usuarios puedan verlos en notificaciones, sin guardar el body.
+    if (!['GET','HEAD','OPTIONS'].includes(String(req.method || '').toUpperCase()) && res.statusCode < 400) {
+      const parts = rel.split('?')[0].split('/').filter(Boolean);
+      let nit = '', contractNo = '', changeLabel = 'Cambio de datos SGRT';
+      const stateIdx = parts.indexOf('sgrt-state');
+      if (stateIdx >= 0 && parts[stateIdx + 1]) nit = sgDecodeHeader(parts[stateIdx + 1]);
+      if (parts.includes('clasificacion')) { changeLabel = 'Actualización de clasificación'; contractNo = sgDecodeHeader(parts[parts.indexOf('clasificacion') + 1] || ''); }
+      else if (parts.includes('evaluador')) { changeLabel = 'Actualización de Ambiente de Control'; contractNo = sgDecodeHeader(parts[parts.indexOf('evaluador') + 1] || ''); }
+      else if (parts.includes('riesgos')) changeLabel = 'Actualización de análisis de riesgos / seguimiento';
+      else if (parts.includes('terceros')) { changeLabel = 'Actualización de tercero'; if (!nit && parts[parts.indexOf('terceros') + 1]) nit = sgDecodeHeader(parts[parts.indexOf('terceros') + 1]); }
+      else if (parts.includes('sharepoint')) changeLabel = 'Actualización de documentación / evidencia';
+      else if (parts.includes('database')) changeLabel = 'Operación de base de datos';
+      sgLogActivity({
+        ...actor,
+        eventType: 'data_change',
+        route: cleanRoute,
+        method: req.method,
+        nit,
+        contractNo,
+        message: `${changeLabel}${nit ? ' · NIT ' + nit : ''}${contractNo ? ' · contrato ' + contractNo : ''}`,
+        meta: { status: res.statusCode, durationMs }
+      }).catch(() => {});
+    }
+  });
+  next();
+});
+
+app.post('/api/telemetry/event', async (req, res) => {
+  try {
+    const actor = { ...sgActorFromRequest(req), ...(req.body && req.body.actor || {}) };
+    const body = req.body || {};
+    await sgLogActivity({
+      ...actor,
+      eventType: body.eventType || 'evento',
+      moduleId: body.moduleId || actor.moduleId,
+      route: body.route || '',
+      method: body.method || '',
+      nit: body.nit || '',
+      contractNo: body.contractNo || body.contrato || '',
+      message: body.message || '',
+      bytesIn: body.bytesIn || 0,
+      bytesOut: body.bytesOut || 0,
+      meta: body.meta || null
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/telemetry/summary', async (req, res) => {
+  try {
+    if (!sgrtActivityReady) await ensureSGRTActivityTable();
+    if (!sgrtActivityReady) return res.status(503).json({ok:false,error:'Telemetría no disponible'});
+    const days = Math.max(1, Math.min(90, Number(req.query.days || 7) || 7));
+    const rq = new sql.Request(pool); rq.input('days', sql.Int, days);
+    const totals = await rq.query(`
+      SELECT
+        COUNT(*) AS TotalEvents,
+        COUNT(DISTINCT NULLIF(UserLogin,N'')) AS UniqueUsers,
+        COUNT(DISTINCT NULLIF(SessionId,N'')) AS Sessions,
+        SUM(CASE WHEN EventType=N'api_request' THEN 1 ELSE 0 END) AS ApiRequests,
+        SUM(CASE WHEN EventType<>N'api_request' THEN 1 ELSE 0 END) AS Actions,
+        SUM(CASE WHEN EventType=N'user_test' THEN 1 ELSE 0 END) AS UserTests,
+        SUM(BytesIn) AS BytesIn,
+        SUM(BytesOut) AS BytesOut,
+        COUNT(DISTINCT CASE WHEN CreatedAt>=DATEADD(HOUR,-24,SYSUTCDATETIME()) THEN NULLIF(UserLogin,N'') END) AS Active24h
+      FROM dbo.SGRT_Activity
+      WHERE CreatedAt>=DATEADD(DAY,-@days,SYSUTCDATETIME())
+    `);
+    const per = await rq.query(`
+      SELECT TOP 200
+        COALESCE(NULLIF(UserLogin,N''),N'(sin identificar)') AS UserLogin,
+        MAX(NULLIF(UserName,N'')) AS UserName,
+        MAX(NULLIF(UserRole,N'')) AS UserRole,
+        MAX(NULLIF(EntityId,N'')) AS EntityId,
+        COUNT(DISTINCT NULLIF(SessionId,N'')) AS Sessions,
+        SUM(CASE WHEN EventType=N'api_request' THEN 1 ELSE 0 END) AS ApiRequests,
+        SUM(CASE WHEN EventType<>N'api_request' THEN 1 ELSE 0 END) AS Actions,
+        SUM(BytesIn) AS BytesIn,
+        SUM(BytesOut) AS BytesOut,
+        MIN(CreatedAt) AS FirstSeen,
+        MAX(CreatedAt) AS LastSeen
+      FROM dbo.SGRT_Activity
+      WHERE CreatedAt>=DATEADD(DAY,-@days,SYSUTCDATETIME())
+      GROUP BY COALESCE(NULLIF(UserLogin,N''),N'(sin identificar)')
+      ORDER BY MAX(CreatedAt) DESC
+    `);
+    const mem = process.memoryUsage();
+    res.json({
+      ok:true, days,
+      totals: totals.recordset[0] || {},
+      users: per.recordset || [],
+      server: {
+        uptimeSeconds: Math.round(process.uptime()),
+        rssMB: Number((mem.rss/1048576).toFixed(1)),
+        heapUsedMB: Number((mem.heapUsed/1048576).toFixed(1)),
+        heapTotalMB: Number((mem.heapTotal/1048576).toFixed(1)),
+        loadAverage: os.loadavg().map(x => Number(x.toFixed(2))),
+        platform: process.platform,
+        node: process.version
+      },
+      note:'El consumo por usuario es una estimación basada en sesiones, solicitudes y tráfico. CPU/RAM se reportan a nivel global del servidor.'
+    });
+  } catch (e) {
+    res.status(500).json({ok:false,error:e.message});
+  }
+});
+
+app.get('/api/telemetry/user-tests', async (req, res) => {
+  try {
+    if (!sgrtActivityReady) await ensureSGRTActivityTable();
+    if (!sgrtActivityReady) return res.status(503).json({ok:false,error:'Actividad no disponible'});
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 30) || 30));
+    const rq = new sql.Request(pool); rq.input('limit', sql.Int, limit);
+    const rs = await rq.query(`
+      SELECT TOP (@limit) ID,CreatedAt,EventType,UserLogin,UserName,UserRole,EntityId,SessionId,ModuleId,Message,Meta
+      FROM dbo.SGRT_Activity
+      WHERE EventType=N'user_test'
+      ORDER BY ID DESC
+    `);
+    const data = (rs.recordset || []).map(row => {
+      let meta = {};
+      try { meta = row.Meta ? JSON.parse(row.Meta) : {}; } catch (e) { meta = {}; }
+      return {...row, meta};
+    });
+    res.json({ok:true,data});
+  } catch (e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+app.get('/api/activity', async (req, res) => {
+  try {
+    if (!sgrtActivityReady) await ensureSGRTActivityTable();
+    if (!sgrtActivityReady) return res.status(503).json({ok:false,error:'Actividad no disponible'});
+    const limit = Math.max(1, Math.min(250, Number(req.query.limit || 80) || 80));
+    const afterId = Math.max(0, Number(req.query.afterId || 0) || 0);
+    const includeApi = String(req.query.includeApi || '') === '1';
+    const rq = new sql.Request(pool);
+    rq.input('limit', sql.Int, limit); rq.input('afterId', sql.BigInt, afterId);
+    const rs = await rq.query(`
+      SELECT TOP (@limit) ID,CreatedAt,EventType,UserLogin,UserName,UserRole,EntityId,SessionId,ModuleId,Route,Method,NIT,ContractNo,Message,Meta
+      FROM dbo.SGRT_Activity
+      WHERE ID>@afterId ${includeApi ? '' : "AND EventType<>N'api_request'"}
+      ORDER BY ID ASC
+    `);
+    res.json({ok:true,data:rs.recordset || [],lastId:(rs.recordset||[]).reduce((m,x)=>Math.max(m,Number(x.ID||0)),afterId)});
+  } catch (e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+app.get('/api/database/control-summary', async (req, res) => {
+  try {
+    const out = [];
+    async function count(table, key, label, deletable, protectedReason) {
+      try {
+        const rs = await new sql.Request(pool).query(`SELECT COUNT(*) AS C FROM ${table}`);
+        out.push({key,label,table,count:Number(rs.recordset[0].C||0),deletable,protectedReason:protectedReason||''});
+      } catch (e) { out.push({key,label,table,count:null,deletable:false,protectedReason:'No disponible: '+e.message}); }
+    }
+    await count('dbo.Terceros','terceros','Maestro de terceros',true,'');
+    await count('dbo.SGRT_Tercero_Estado','state','Estado SGRT por tercero',true,'');
+    await count('dbo.SGRT_Activity','activity','Actividad y telemetría',true,'');
+    await count('dbo.SGRT_Entidades','entities','Organizaciones / configuración',false,'Protegido para evitar romper usuarios, alcance y configuración del sistema.');
+    res.json({ok:true,items:out,protected:['Estructura SQL','Credenciales / variables de entorno','Organizaciones mediante borrado masivo','Configuración de la aplicación']});
+  } catch (e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+app.post('/api/database/selective-delete', async (req, res) => {
+  try {
+    const body = req.body || {}, action = String(body.action || '');
+    if (action === 'activity_before') {
+      const days = Math.max(1, Math.min(3650, Number(body.days || 90) || 90));
+      const rq = new sql.Request(pool); rq.input('days', sql.Int, days);
+      const rs = await rq.query(`DELETE FROM dbo.SGRT_Activity WHERE CreatedAt<DATEADD(DAY,-@days,SYSUTCDATETIME()); SELECT @@ROWCOUNT AS Deleted;`);
+      return res.json({ok:true,deleted:Number((rs.recordset&&rs.recordset[0]&&rs.recordset[0].Deleted)||0),message:`Actividad anterior a ${days} días eliminada`});
+    }
+    const nit = sgTrim(body.nit, 80);
+    if (!nit) return res.status(400).json({ok:false,error:'NIT obligatorio'});
+    if (action === 'state_by_nit') {
+      await ensureSGRTRecycleTable(); const tx=new sql.Transaction(pool); await tx.begin();
+      try { const rq=new sql.Request(tx); rq.input('nit',sql.NVarChar(50),nit); const pre=await rq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`);
+        if(pre.recordset.length){let st={};try{st=JSON.parse(pre.recordset[0].Payload||'{}');}catch(e){}await sgRecycleInsert({entityType:'state_full',nit,itemId:nit,label:'Estado SGRT completo · '+nit,payload:{estado_sgrt:st}},sgActorFromRequest(req),tx);}
+        const rs=await rq.query(`DELETE FROM dbo.SGRT_Tercero_Estado WHERE NIT=@nit; SELECT @@ROWCOUNT AS Deleted;`); await tx.commit();
+        return res.json({ok:true,deleted:Number((rs.recordset&&rs.recordset[0]&&rs.recordset[0].Deleted)||0),message:'Estado SGRT eliminado para '+nit+' · recuperable desde ISEGURAS'});
+      }catch(e){try{await tx.rollback();}catch(_){}throw e;}
+    }
+    if (action === 'third_full') {
+      if (String(body.confirm || '') !== `ELIMINAR ${nit}`) return res.status(400).json({ok:false,error:`Confirmación inválida. Escribe exactamente: ELIMINAR ${nit}`});
+      await ensureSGRTRecycleTable(); const tx = new sql.Transaction(pool); await tx.begin();
+      try {
+        const rq = new sql.Request(tx); rq.input('nit', sql.NVarChar(50), nit);
+        const tr=await rq.query(`SELECT TOP 1 * FROM dbo.Terceros WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`); const sr=await rq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`); let st=null;if(sr.recordset.length){try{st=JSON.parse(sr.recordset[0].Payload||'{}');}catch(e){st={};}}
+        if(tr.recordset.length||st)await sgRecycleInsert({entityType:'tercero_full',nit,itemId:nit,label:'Tercero completo · '+String((tr.recordset[0]&&tr.recordset[0].Nombre_Tercero)||nit),payload:{tercero:tr.recordset[0]||{NIT:nit},estado_sgrt:st}},sgActorFromRequest(req),tx);
+        await rq.query(`IF OBJECT_ID('dbo.SGRT_Tercero_Estado','U') IS NOT NULL DELETE FROM dbo.SGRT_Tercero_Estado WHERE NIT=@nit; DELETE FROM dbo.Terceros WHERE NIT=@nit;`);
+        await tx.commit();
+      } catch (x) { try{await tx.rollback();}catch(_){} throw x; }
+      return res.json({ok:true,message:'Tercero y estado SGRT eliminados para '+nit+' · recuperables desde ISEGURAS'});
+    }
+    return res.status(400).json({ok:false,error:'Acción de borrado no permitida'});
+  } catch (e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+
+// ================================================================
+// API PAPELERA / RECUPERACIÓN — SOLO ISEGURAS
+// ================================================================
+app.get('/api/recycle-bin', async (req,res)=>{
+  try{
+    if(!sgIsISEGURASRequest(req)) return res.status(403).json({ok:false,error:'Solo ISEGURAS puede consultar la papelera'});
+    if(!sgrtRecycleReady) await ensureSGRTRecycleTable();
+    if(!sgrtRecycleReady) return res.status(503).json({ok:false,error:'Papelera SGRT no disponible'});
+    const status=String(req.query.status||'Deleted'); const limit=Math.max(1,Math.min(500,Number(req.query.limit||200)||200)); const q=String(req.query.q||'').trim();
+    const rq=new sql.Request(pool);rq.input('status',sql.NVarChar(30),status);rq.input('limit',sql.Int,limit);rq.input('q',sql.NVarChar(300),q?('%'+q+'%'):null);
+    const rs=await rq.query(`SELECT TOP (@limit) ID,DeletedAt,EntityType,NIT,ContractNo,ItemId,Label,DeletedByLogin,DeletedByName,DeletedByRole,EntityId,Status,RestoredAt,RestoredByLogin,RestoredByName FROM dbo.SGRT_RecycleBin WHERE Status=@status AND (@q IS NULL OR Label LIKE @q OR NIT LIKE @q OR ContractNo LIKE @q OR DeletedByName LIKE @q OR DeletedByLogin LIKE @q) ORDER BY DeletedAt DESC,ID DESC`);
+    res.json({ok:true,data:rs.recordset||[]});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.get('/api/recycle-bin/:id', async (req,res)=>{
+  try{
+    if(!sgIsISEGURASRequest(req)) return res.status(403).json({ok:false,error:'Solo ISEGURAS puede consultar la papelera'});
+    if(!sgrtRecycleReady) await ensureSGRTRecycleTable();
+    const rq=new sql.Request(pool);rq.input('id',sql.BigInt,Number(req.params.id));const rs=await rq.query(`SELECT TOP 1 * FROM dbo.SGRT_RecycleBin WHERE ID=@id`);if(!rs.recordset.length)return res.status(404).json({ok:false,error:'Elemento no encontrado'});
+    const row=rs.recordset[0];let payload=null;try{payload=JSON.parse(row.Payload||'null');}catch(e){}delete row.Payload;res.json({ok:true,data:{...row,payload}});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.post('/api/recycle-bin/:id/restore', async (req,res)=>{
+  try{
+    if(!sgIsISEGURASRequest(req)) return res.status(403).json({ok:false,error:'Solo ISEGURAS puede restaurar elementos'});
+    const result=await sgRestoreRecycleItem(req.params.id,sgActorFromRequest(req));
+    await sgLogActivity({...sgActorFromRequest(req),eventType:'restore',nit:result.nit,contractNo:result.contractNo,message:'Restauración ISEGURAS · '+String(result.label||result.entityType),meta:{recycleId:result.id,entityType:result.entityType}});
+    res.json({ok:true,message:'Elemento restaurado correctamente',data:result});
+  }catch(e){res.status(400).json({ok:false,error:e.message});}
+});
+
+// ================================================================
+// API ESTADO EXTENDIDO SGRT
+// ================================================================
+app.get('/api/sgrt-state', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    if (!sgrtStateReady) await ensureSGRTStateTable();
+    if (!sgrtStateReady) return res.status(503).json({ok:false,error:'Tabla de estado SGRT no disponible'});
+    const result = await new sql.Request(pool).query(`SELECT NIT, Payload, UpdatedAt FROM dbo.SGRT_Tercero_Estado ORDER BY UpdatedAt DESC`);
+    const data = result.recordset.map(row => {
+      let estado_sgrt = {};
+      try { estado_sgrt = JSON.parse(row.Payload || '{}'); } catch (e) {}
+      estado_sgrt = hydrateEvaluatorResponses(estado_sgrt);
+      return {nit: row.NIT, estado_sgrt, updatedAt: row.UpdatedAt};
+    });
+    res.json({ok:true,count:data.length,data});
+  } catch (error) {
+    console.error('❌ GET /api/sgrt-state:', error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+app.get('/api/sgrt-state/:nit', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const state = await getSGRTState(req.params.nit);
+    if (!state) return res.status(404).json({ok:false,error:'Estado SGRT no encontrado',nit:req.params.nit});
+    res.json({ok:true,data:state});
+  } catch (error) {
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+app.post('/api/sgrt-state/:nit', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const nit = String(req.params.nit || '').trim();
+    if (!nit) return res.status(400).json({ok:false,error:'NIT obligatorio'});
+    const payload = (req.body && req.body.estado_sgrt && typeof req.body.estado_sgrt === 'object') ? req.body.estado_sgrt : (req.body || {});
+    payload.nit = payload.nit || nit;
+    const merged = await upsertSGRTStatePreservingEvaluator(nit, payload);
+    res.json({ok:true,message:'Estado SGRT persistido sin perder cambios concurrentes del Evaluador',nit,data:{estado_sgrt:merged}});
+  } catch (error) {
+    console.error('❌ POST /api/sgrt-state:', error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+
+
+
+// PATCH específico del Administrador de Riesgos: guarda tipologías/valoración
+// únicamente para el contrato activo, sin reemplazar otros contratos.
+app.patch('/api/sgrt-state/:nit/clasificacion/:contrato', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const nit = String(req.params.nit || '').trim();
+    const contrato = String(req.params.contrato || '').trim();
+    if (!nit || !contrato) return res.status(400).json({ok:false,error:'NIT y contrato son obligatorios'});
+    const estado_sgrt = await patchClassificationStateByContract(nit, contrato, req.body || {});
+    res.json({ok:true,message:'Clasificación sincronizada por contrato',data:{nit,estado_sgrt}});
+  } catch (error) {
+    console.error('❌ PATCH /api/sgrt-state/:nit/clasificacion/:contrato:', error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+
+
+// PATCH atómico de la matriz de riesgos del tercero.
+app.patch('/api/sgrt-state/:nit/riesgos', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const nit = String(req.params.nit || '').trim();
+    if (!nit) return res.status(400).json({ok:false,error:'NIT obligatorio'});
+    const estado_sgrt = await patchRiskState(nit, req.body || {});
+    res.json({ok:true,message:'Riesgos sincronizados sin reemplazar cambios concurrentes',data:{nit,estado_sgrt}});
+  } catch (error) {
+    console.error('❌ PATCH /api/sgrt-state/:nit/riesgos:', error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+
+// PATCH de documentos generados por IA/reportes del tercero.
+app.patch('/api/sgrt-state/:nit/documentos', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const nit = String(req.params.nit || '').trim();
+    if (!nit) return res.status(400).json({ok:false,error:'NIT obligatorio'});
+    const estado_sgrt = await patchGeneratedDocuments(nit, req.body || {});
+    res.json({ok:true,message:'Documentos generados sincronizados',data:{nit,estado_sgrt}});
+  } catch (error) {
+    console.error('❌ PATCH /api/sgrt-state/:nit/documentos:', error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+
+// Copia EXPLÍCITA de respuestas del Evaluador entre tercero/contrato.
+// Nada se replica de forma automática: esta ruta solo se ejecuta al pulsar "Rellenar respuestas".
+function sgrtTipCanon(v) {
+  return String(v == null ? '' : v)
+    .trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-z0-9]/g,'');
+}
+function sgrtTipAliases(d) {
+  if (!d || typeof d !== 'object') return [];
+  return [d.key,d.id,d.codigo,d.nombre,d.nombre_tipologia,d.tipologia,d.name]
+    .map(sgrtTipCanon).filter(Boolean);
+}
+function sgrtStateDimsForContract(payload, contrato) {
+  const maps=[payload&&payload.dimsPorContrato,payload&&payload.tipologiasPorContrato];
+  for (const map of maps) {
+    const k=sgrtContractMapKey(map,contrato);
+    if (k && Array.isArray(map[k])) return sgrtPlainClone(map[k]);
+  }
+  return [];
+}
+function sgrtAnswerBlockForContract(payload, contrato) {
+  payload=hydrateEvaluatorResponses(payload||{});
+  const maps=[payload.respuestasACPorContrato,payload.respuestasPorContrato,payload._respuestasPorContrato];
+  for (const map of maps) {
+    const k=sgrtContractMapKey(map,contrato);
+    if (k && map[k] && typeof map[k]==='object') return sgrtPlainClone(map[k]);
+  }
+  return {};
+}
+function sgrtAnswerBucketKey(answerBlock, dims, targetDim) {
+  const targetAliases=new Set(sgrtTipAliases(targetDim));
+  const direct=[targetDim&&targetDim.key,targetDim&&targetDim.id,targetDim&&targetDim.codigo,targetDim&&targetDim.nombre,targetDim&&targetDim.tipologia]
+    .filter(Boolean).map(String);
+  for (const k of direct) if (answerBlock[k] && typeof answerBlock[k]==='object') return k;
+  for (const d of (dims||[])) {
+    const aliases=sgrtTipAliases(d);
+    if (!aliases.some(a=>targetAliases.has(a))) continue;
+    const candidates=[d.key,d.id,d.codigo,d.nombre,d.tipologia].filter(Boolean).map(String);
+    for (const k of candidates) if (answerBlock[k] && typeof answerBlock[k]==='object') return k;
+  }
+  for (const k of Object.keys(answerBlock||{})) if (targetAliases.has(sgrtTipCanon(k))) return k;
+  return '';
+}
+function sgrtCountControlAnswers(bucket) {
+  if (!bucket || typeof bucket!=='object') return 0;
+  return Object.keys(bucket).filter(k=>bucket[k] && typeof bucket[k]==='object' && Object.keys(bucket[k]).length).length;
+}
+async function copyEvaluatorAnswersAtomic(sourceNit, sourceContract, targetNit, targetContract, requestedTip) {
+  if (!sgrtStateReady) await ensureSGRTStateTable();
+  if (!sgrtStateReady) throw new Error('La tabla dbo.SGRT_Tercero_Estado no está disponible');
+  const srcRow=await getSGRTState(sourceNit);
+  const dstRow=await getSGRTState(targetNit);
+  if (!srcRow || !srcRow.estado_sgrt) throw new Error('No existe estado SGRT del tercero origen');
+  const src=hydrateEvaluatorResponses(srcRow.estado_sgrt||{});
+  const dst=hydrateEvaluatorResponses((dstRow&&dstRow.estado_sgrt)||{});
+  const srcAnswers=sgrtAnswerBlockForContract(src,sourceContract);
+  const srcDims=sgrtStateDimsForContract(src,sourceContract);
+  const dstDims=sgrtStateDimsForContract(dst,targetContract);
+  if (!Object.keys(srcAnswers).length) return {copied:0,tipologias:[],estado_sgrt:dst};
+  const selectedAll=!requestedTip || requestedTip==='__all__';
+  const targetDims=selectedAll ? dstDims : dstDims.filter(d=>{
+    const aliases=sgrtTipAliases(d);
+    return aliases.includes(sgrtTipCanon(requestedTip)) ||
+      [d.key,d.id,d.codigo,d.nombre,d.tipologia].some(v=>String(v||'')===String(requestedTip||''));
+  });
+  const fallbackTargets=!targetDims.length && !selectedAll ? [{key:requestedTip,nombre:requestedTip}] : targetDims;
+  const targetCurrent=sgrtAnswerBlockForContract(dst,targetContract);
+  let copied=0;
+  const copiedTips=[];
+  for (const td of fallbackTargets) {
+    const sourceKey=sgrtAnswerBucketKey(srcAnswers,srcDims,td);
+    if (!sourceKey) continue;
+    const targetKey=String(td.key||td.id||td.codigo||td.nombre||td.tipologia||requestedTip||sourceKey);
+    const bucket=sgrtPlainClone(srcAnswers[sourceKey]||{});
+    const n=sgrtCountControlAnswers(bucket);
+    if (!n) continue;
+    targetCurrent[targetKey]=bucket;
+    copied+=n;
+    copiedTips.push({sourceKey,targetKey,name:String(td.nombre||td.nombre_tipologia||td.tipologia||td.name||targetKey),controles:n});
+  }
+  if (!copied) return {copied:0,tipologias:[],estado_sgrt:dst};
+  const merged=await patchEvaluatorStateByContract(targetNit,targetContract,{replaceResponses:true,respuestas:targetCurrent,savedAt:new Date().toISOString()});
+  return {copied,tipologias:copiedTips,estado_sgrt:merged};
+}
+
+app.post('/api/sgrt-state/copy-evaluator', async (req,res)=>{
+  try{
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const b=req.body||{};
+    const sourceNit=String(b.sourceNit||'').trim();
+    const sourceContract=String(b.sourceContract||'').trim();
+    const targetNit=String(b.targetNit||'').trim();
+    const targetContract=String(b.targetContract||'').trim();
+    const tipologia=String(b.tipologia||'__all__').trim();
+    if(!sourceNit||!sourceContract||!targetNit||!targetContract) return res.status(400).json({ok:false,error:'Origen y destino son obligatorios'});
+    const result=await copyEvaluatorAnswersAtomic(sourceNit,sourceContract,targetNit,targetContract,tipologia);
+    res.json({ok:true,message:result.copied?('Se copiaron '+result.copied+' control(es) por decisión del usuario'):'No se encontraron respuestas compatibles para copiar',data:result});
+  }catch(error){
+    console.error('❌ POST /api/sgrt-state/copy-evaluator:',error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+// PATCH específico del rol Evaluador: actualiza únicamente el contrato activo.
+// No reemplaza el JSON completo del tercero y por eso es seguro para trabajo concurrente.
+app.patch('/api/sgrt-state/:nit/evaluador/:contrato', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    const nit = String(req.params.nit || '').trim();
+    const contrato = String(req.params.contrato || '').trim();
+    if (!nit || !contrato) return res.status(400).json({ok:false,error:'NIT y contrato son obligatorios'});
+    const estado_sgrt = await patchEvaluatorStateByContract(nit, contrato, req.body || {});
+    res.json({ok:true,message:'Estado del Evaluador sincronizado por contrato',data:{nit,estado_sgrt}});
+  } catch (error) {
+    console.error('❌ PATCH /api/sgrt-state/:nit/evaluador/:contrato:', error.message);
+    res.status(500).json({ok:false,error:error.message});
+  }
+});
+
+app.delete('/api/sgrt-state/:nit', async (req, res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    if (!sgrtStateReady) await ensureSGRTStateTable();
+    if (!sgrtStateReady) return res.status(503).json({ok:false,error:'Tabla de estado SGRT no disponible'});
+    await ensureSGRTRecycleTable();
+    const nit=String(req.params.nit); const tx=new sql.Transaction(pool); await tx.begin();
+    try {
+      const rq=new sql.Request(tx); rq.input('nit',sql.NVarChar(50),nit);
+      const rs=await rq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`);
+      if (rs.recordset.length) { let st={}; try{st=JSON.parse(rs.recordset[0].Payload||'{}');}catch(e){} await sgRecycleInsert({entityType:'state_full',nit,itemId:nit,label:'Estado SGRT completo · '+nit,payload:{estado_sgrt:st}},sgActorFromRequest(req),tx); }
+      await rq.query(`DELETE FROM dbo.SGRT_Tercero_Estado WHERE NIT=@nit`); await tx.commit();
+      res.json({ok:true,nit:req.params.nit});
+    } catch(e){try{await tx.rollback();}catch(_){}throw e;}
+  } catch (error) { res.status(500).json({ok:false,error:error.message}); }
+});
+
+// ================================================================
+// API ENTIDADES / ORGANIZACIONES
+// ================================================================
+app.get('/api/entidades', async (req,res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    if (!sgrtEntitiesReady) await ensureSGRTEntitiesTable();
+    const result = await new sql.Request(pool).query(`
+      SELECT Entidad_ID AS id, Nombre AS nombre, Acronimo AS acronimo, Estado AS estado,
+             FechaCreacion AS fechaCreacion, UpdatedAt AS updatedAt
+      FROM dbo.SGRT_Entidades
+      WHERE Estado <> N'Inactivo'
+      ORDER BY Nombre
+    `);
+    res.json({ok:true,count:result.recordset.length,data:result.recordset});
+  } catch(e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+app.post('/api/entidades', async (req,res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    await upsertEntidadSGRT(req.body || {});
+    res.json({ok:true});
+  } catch(e) { res.status(400).json({ok:false,error:e.message}); }
+});
+
+app.post('/api/entidades/sync', async (req,res) => {
+  try {
+    if (!pool || !pool.connected) return res.status(503).json({ok:false,error:'No hay conexión a base de datos'});
+    if (!sgrtEntitiesReady) await ensureSGRTEntitiesTable();
+    const list = Array.isArray(req.body && req.body.entidades) ? req.body.entidades : [];
+    const ids=[];
+    for (const ent of list) {
+      const id=String(ent.id || ent.Entidad_ID || '').trim();
+      if(!id) continue;
+      ids.push(id);
+      await upsertEntidadSGRT(ent);
+    }
+    // Las entidades eliminadas en la app quedan inactivas, preservando histórico.
+    const current = await new sql.Request(pool).query(`SELECT Entidad_ID FROM dbo.SGRT_Entidades WHERE Estado<>N'Inactivo'`);
+    for(const row of current.recordset){
+      if(ids.indexOf(String(row.Entidad_ID))<0){
+        const rq=new sql.Request(pool);rq.input('id',sql.NVarChar(120),String(row.Entidad_ID));
+        await rq.query(`UPDATE dbo.SGRT_Entidades SET Estado=N'Inactivo',UpdatedAt=SYSUTCDATETIME() WHERE Entidad_ID=@id`);
+      }
+    }
+    res.json({ok:true,count:ids.length});
+  } catch(e) { res.status(500).json({ok:false,error:e.message}); }
+});
+
+// ================================================================
+// HEALTH CHECK
+// ================================================================
+
+app.get('/health', (req, res) => {
+
+  const connected =
+    pool !== null &&
+    pool.connected === true;
+
+  res.status(
+    connected ? 200 : 503
+  ).json({
+
+    status:
+      connected
+        ? 'healthy'
+        : 'unhealthy',
+
+    timestamp:
+      new Date().toISOString(),
+
+    uptime:
+      process.uptime(),
+
+    environment:
+      process.env.NODE_ENV ||
+      'production',
+
+    version:
+      '10.0.0',
+
+    database: {
+
+      connected,
+
+      server:
+        config.server,
+
+      database:
+        config.database
+
+    }
+
+  });
+
+});
+
+// ================================================================
+// TEST REAL DE AZURE SQL
+// ================================================================
+
+app.get('/test-db', async (req, res) => {
+
+  try {
+
+    if (!pool || !pool.connected) {
+
+      return res.status(503).json({
+
+        ok: false,
+
+        connected: false,
+
+        server: config.server,
+
+        database: config.database,
+
+        error:
+          'No existe conexión con Azure SQL'
+
+      });
+
+    }
+
+    const request =
+      new sql.Request(pool);
+
+    const result =
+      await request.query(`
+
+        SELECT
+
+          GETDATE() AS server_time,
+
+          @@SERVERNAME AS server_name,
+
+          DB_NAME() AS database_name
+
+      `);
+
+    const row =
+      result.recordset[0];
+
+    res.status(200).json({
+
+      ok: true,
+
+      connected: true,
+
+      message:
+        'Conexión REAL con Azure SQL funcionando',
+
+      server:
+        config.server,
+
+      database:
+        config.database,
+
+      server_info: {
+
+        server_name:
+          row.server_name,
+
+        database_name:
+          row.database_name,
+
+        server_time:
+          row.server_time
+
+      },
+
+      timestamp:
+        new Date().toISOString()
+
+    });
+
+  } catch (error) {
+
+    console.error(
+      '❌ Error /test-db:',
+      error
+    );
+
+    res.status(503).json({
+
+      ok: false,
+
+      connected: false,
+
+      error:
+        error.message
+
+    });
+
+  }
+
+});
+
+// ================================================================
+// STATUS
+// ================================================================
+
+app.get('/api/status', (req, res) => {
+
+  const connected =
+    pool !== null &&
+    pool.connected === true;
+
+  res.status(200).json({
+
+    ok: true,
+
+    service:
+      'SGRT v11',
+
+    status:
+      connected
+        ? 'connected'
+        : 'disconnected',
+
+    version:
+      '10.0.0',
+
+    timestamp:
+      new Date().toISOString(),
+
+    database: {
+
+      server:
+        config.server,
+
+      database:
+        config.database,
+
+      connected
+
+    },
+
+    endpoints: [
+
+      'GET /api/terceros',
+
+      'GET /api/terceros/:nit',
+
+      'POST /api/terceros',
+
+      'PUT /api/terceros/:nit',
+
+      'DELETE /api/terceros/:nit',
+
+      'POST /api/clasificacion',
+
+      'GET /api/database/tables',
+
+      'GET /api/database/schema'
+
+    ]
+
+  });
+
+});
+
+// ================================================================
+// CONSULTAR TABLAS
+// ================================================================
+
+app.get(
+  '/api/database/tables',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a Azure SQL'
+
+        });
+
+      }
+
+      const request =
+        new sql.Request(pool);
+
+      const result =
+        await request.query(`
+
+          SELECT
+
+            TABLE_SCHEMA,
+
+            TABLE_NAME
+
+          FROM INFORMATION_SCHEMA.TABLES
+
+          WHERE TABLE_TYPE = 'BASE TABLE'
+
+          ORDER BY
+            TABLE_SCHEMA,
+            TABLE_NAME
+
+        `);
+
+      res.json({
+
+        ok: true,
+
+        database:
+          config.database,
+
+        count:
+          result.recordset.length,
+
+        tables:
+          result.recordset
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ Error consultando tablas:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// ESQUEMA DE TERCEROS
+// ================================================================
+
+app.get(
+  '/api/database/schema',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a Azure SQL'
+
+        });
+
+      }
+
+      const request =
+        new sql.Request(pool);
+
+      const result =
+        await request.query(`
+
+          SELECT
+
+            COLUMN_NAME,
+
+            DATA_TYPE,
+
+            CHARACTER_MAXIMUM_LENGTH,
+
+            IS_NULLABLE
+
+          FROM INFORMATION_SCHEMA.COLUMNS
+
+          WHERE
+
+            TABLE_SCHEMA = 'dbo'
+
+            AND TABLE_NAME = 'Terceros'
+
+          ORDER BY
+            ORDINAL_POSITION
+
+        `);
+
+      res.json({
+
+        ok: true,
+
+        table:
+          'dbo.Terceros',
+
+        columns:
+          result.recordset
+
+      });
+
+    } catch (error) {
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// GET TODOS LOS TERCEROS
+// ================================================================
+
+app.get(
+  '/api/terceros',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a base de datos'
+
+        });
+
+      }
+
+      const request =
+        new sql.Request(pool);
+
+      const result =
+        await request.query(`
+
+          SELECT
+
+            NIT,
+            NIT AS nit,
+            Nombre_Tercero,
+            Nombre_Tercero AS nombre,
+            Servicio_Contratado,
+            Servicio_Contratado AS servicio_contratado,
+            Domicilio,
+            Domicilio AS domicilio,
+            Fecha_Registro
+
+          FROM dbo.Terceros
+
+          ORDER BY
+            Fecha_Registro DESC
+
+      `);
+
+      // También incluir estados SGRT que todavía no tengan fila en dbo.Terceros.
+      // Esto recupera registros creados por versiones anteriores y evita que el
+      // Evaluador vea una lista incompleta de "Registro de Terceros y Clasificación".
+      const terceros = Array.isArray(result.recordset) ? result.recordset.slice() : [];
+      const seen = new Set(terceros.map(row => String(row.NIT || row.nit || '').trim()).filter(Boolean));
+
+      if (!sgrtStateReady) await ensureSGRTStateTable();
+      if (sgrtStateReady) {
+        const stateRows = await new sql.Request(pool).query(`SELECT NIT, Payload, UpdatedAt FROM dbo.SGRT_Tercero_Estado ORDER BY UpdatedAt DESC`);
+        stateRows.recordset.forEach(row => {
+          const nit = String(row.NIT || '').trim();
+          if (!nit || seen.has(nit)) return;
+          let payload = {};
+          try { payload = JSON.parse(row.Payload || '{}'); } catch (e) { payload = {}; }
+          payload = hydrateEvaluatorResponses(payload);
+          terceros.push({
+            NIT: nit,
+            nit,
+            Nombre_Tercero: payload.nombre || payload.NombreTercero || payload.Nombre_Tercero || nit,
+            nombre: payload.nombre || payload.NombreTercero || payload.Nombre_Tercero || nit,
+            Servicio_Contratado: payload.servicio_contratado || payload.servicioContratado || payload.servicio || '',
+            servicio_contratado: payload.servicio_contratado || payload.servicioContratado || payload.servicio || '',
+            Domicilio: payload.domicilio || payload.Domicilio || '',
+            domicilio: payload.domicilio || payload.Domicilio || '',
+            Fecha_Registro: payload.fecha_registro || payload.fechaRegistro || payload.savedAt || row.UpdatedAt,
+            _recuperado_desde_estado: true
+          });
+          seen.add(nit);
+        });
+      }
+
+      terceros.sort((a,b) => {
+        const da = new Date(a.Fecha_Registro || 0).getTime() || 0;
+        const db = new Date(b.Fecha_Registro || 0).getTime() || 0;
+        return db - da;
+      });
+
+      console.log(
+        `✅ GET /api/terceros → ${terceros.length} registros`
+      );
+
+      res.status(200).json({
+
+        ok: true,
+
+        count:
+          terceros.length,
+
+        data:
+          terceros,
+
+        timestamp:
+          new Date().toISOString()
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ GET /api/terceros:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// GET TERCERO POR NIT
+// ================================================================
+
+app.get(
+  '/api/terceros/:nit',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a base de datos'
+
+        });
+
+      }
+
+      const nit =
+        req.params.nit;
+
+      const request =
+        new sql.Request(pool);
+
+      request.input(
+        'nit',
+        sql.NVarChar(50),
+        nit
+      );
+
+      const result =
+        await request.query(`
+
+          SELECT
+
+            NIT,
+            NIT AS nit,
+            Nombre_Tercero,
+            Nombre_Tercero AS nombre,
+            Servicio_Contratado,
+            Servicio_Contratado AS servicio_contratado,
+            Domicilio,
+            Domicilio AS domicilio,
+            Fecha_Registro
+
+          FROM dbo.Terceros
+
+          WHERE NIT = @nit
+
+        `);
+
+      if (
+        result.recordset.length === 0
+      ) {
+
+        return res.status(404).json({
+
+          ok: false,
+
+          error:
+            'Tercero no encontrado',
+
+          nit
+
+        });
+
+      }
+
+      res.json({
+
+        ok: true,
+
+        data:
+          result.recordset[0]
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ GET tercero:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// CREAR TERCERO
+// ================================================================
+
+app.post(
+  '/api/terceros',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a base de datos'
+
+        });
+
+      }
+
+      const body = req.body || {};
+      const source = body.tercero && typeof body.tercero === 'object' ? body.tercero : body;
+      const nit = source.nit || source.NIT || body.nit || body.NIT;
+      const nombre = source.nombre || source.NombreTercero || source.Nombre_Tercero || source.Nombre || body.nombre || body.Nombre;
+      const domicilio = source.domicilio || source.Domicilio || body.domicilio || body.Domicilio || null;
+      const servicio_contratado = source.servicio_contratado || source.servicio || source.ServicioContratado || source.Servicio_Contratado || body.servicio_contratado || body.servicio || null;
+
+      if (!nit || !nombre) {
+
+        return res.status(400).json({
+
+          ok: false,
+
+          error:
+            'NIT y nombre son obligatorios'
+
+        });
+
+      }
+
+      const request =
+        new sql.Request(pool);
+
+      request.input(
+        'nit',
+        sql.NVarChar(50),
+        nit
+      );
+
+      request.input(
+        'nombre',
+        sql.NVarChar(255),
+        nombre
+      );
+
+      request.input(
+        'domicilio',
+        sql.NVarChar(255),
+        domicilio || null
+      );
+
+      request.input(
+        'servicio',
+        sql.NVarChar(255),
+        servicio_contratado || null
+      );
+
+      // ------------------------------------------------------------
+      // Verificar existencia
+      // ------------------------------------------------------------
+
+      const exists =
+        await request.query(`
+
+          SELECT NIT
+
+          FROM dbo.Terceros
+
+          WHERE NIT = @nit
+
+        `);
+
+      // ------------------------------------------------------------
+      // ACTUALIZAR
+      // ------------------------------------------------------------
+
+      if (exists.recordset.length > 0) {
+
+        await request.query(`
+
+          UPDATE dbo.Terceros
+
+          SET
+
+            Nombre_Tercero =
+              @nombre,
+
+            Domicilio =
+              @domicilio,
+
+            Servicio_Contratado =
+              @servicio
+
+          WHERE NIT = @nit
+
+        `);
+
+        console.log(
+          `✅ Tercero actualizado: ${nit}`
+        );
+
+        return res.status(200).json({
+
+          ok: true,
+
+          message:
+            'Tercero actualizado',
+
+          nit
+
+        });
+
+      }
+
+      // ------------------------------------------------------------
+      // INSERTAR
+      // ------------------------------------------------------------
+
+      await request.query(`
+
+        INSERT INTO dbo.Terceros
+
+        (
+
+          NIT,
+
+          Nombre_Tercero,
+
+          Servicio_Contratado,
+
+          Domicilio,
+
+          Fecha_Registro
+
+        )
+
+        VALUES
+
+        (
+
+          @nit,
+
+          @nombre,
+
+          @servicio,
+
+          @domicilio,
+
+          GETDATE()
+
+        )
+
+      `);
+
+      console.log(
+        `✅ Tercero creado: ${nit}`
+      );
+
+      res.status(201).json({
+
+        ok: true,
+
+        message:
+          'Tercero creado',
+
+        nit,
+
+        nombre,
+
+        database:
+          config.database
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ POST /api/terceros:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// ACTUALIZAR TERCERO
+// ================================================================
+
+app.put(
+  '/api/terceros/:nit',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a base de datos'
+
+        });
+
+      }
+
+      const nit =
+        req.params.nit;
+
+      const {
+
+        nombre,
+
+        domicilio,
+
+        servicio_contratado
+
+      } = req.body;
+
+      const request =
+        new sql.Request(pool);
+
+      request.input(
+        'nit',
+        sql.NVarChar(50),
+        nit
+      );
+
+      request.input(
+        'nombre',
+        sql.NVarChar(255),
+        nombre
+      );
+
+      request.input(
+        'domicilio',
+        sql.NVarChar(255),
+        domicilio || null
+      );
+
+      request.input(
+        'servicio',
+        sql.NVarChar(255),
+        servicio_contratado || null
+      );
+
+      const result =
+        await request.query(`
+
+          UPDATE dbo.Terceros
+
+          SET
+
+            Nombre_Tercero =
+              @nombre,
+
+            Domicilio =
+              @domicilio,
+
+            Servicio_Contratado =
+              @servicio
+
+          WHERE NIT = @nit
+
+        `);
+
+      if (
+        result.rowsAffected[0] === 0
+      ) {
+
+        return res.status(404).json({
+
+          ok: false,
+
+          error:
+            'Tercero no encontrado',
+
+          nit
+
+        });
+
+      }
+
+      console.log(
+        `✅ Tercero actualizado: ${nit}`
+      );
+
+      res.json({
+
+        ok: true,
+
+        message:
+          'Tercero actualizado',
+
+        nit
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ PUT /api/terceros:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// ELIMINAR TERCERO
+// ================================================================
+
+app.delete(
+  '/api/terceros/:nit',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a base de datos'
+
+        });
+
+      }
+
+      const nit =
+        req.params.nit;
+
+      const request =
+        new sql.Request(pool);
+
+      request.input(
+        'nit',
+        sql.NVarChar(50),
+        nit
+      );
+
+      // Borrado coherente e idempotente con copia recuperable previa.
+      await ensureSGRTRecycleTable();
+      const tx=new sql.Transaction(pool); await tx.begin(); let result;
+      try {
+        const rq=new sql.Request(tx); rq.input('nit',sql.NVarChar(50),nit);
+        const tr=await rq.query(`SELECT TOP 1 * FROM dbo.Terceros WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`);
+        const sr=await rq.query(`SELECT Payload FROM dbo.SGRT_Tercero_Estado WITH (UPDLOCK,HOLDLOCK) WHERE NIT=@nit`);
+        let st=null;if(sr.recordset.length){try{st=JSON.parse(sr.recordset[0].Payload||'{}');}catch(e){st={};}}
+        if(tr.recordset.length||st) await sgRecycleInsert({entityType:'tercero_full',nit,itemId:nit,label:'Tercero completo · '+String((tr.recordset[0]&&tr.recordset[0].Nombre_Tercero)||nit),payload:{tercero:tr.recordset[0]||{NIT:nit},estado_sgrt:st}},sgActorFromRequest(req),tx);
+        result=await rq.query(`IF OBJECT_ID('dbo.SGRT_Tercero_Estado','U') IS NOT NULL DELETE FROM dbo.SGRT_Tercero_Estado WHERE NIT=@nit; DELETE FROM dbo.Terceros WHERE NIT=@nit; SELECT @@ROWCOUNT AS deleted;`);
+        await tx.commit();
+      }catch(e){try{await tx.rollback();}catch(_){}throw e;}
+
+      const deleted =
+        Number((result.recordset && result.recordset[0] && result.recordset[0].deleted) || 0);
+
+      console.log(
+        deleted
+          ? `🗑️ Tercero eliminado: ${nit}`
+          : `ℹ️ Tercero ya estaba eliminado: ${nit}`
+      );
+
+      // Idempotente: si ya no existe, sigue siendo un borrado exitoso.
+      res.json({
+
+        ok: true,
+
+        message:
+          deleted
+            ? 'Tercero eliminado'
+            : 'Tercero ya estaba eliminado',
+
+        nit,
+
+        deleted:
+          deleted > 0
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ DELETE /api/terceros:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// CLASIFICACIÓN
+// ================================================================
+//
+// IMPORTANTE:
+// La tabla dbo.Terceros REAL que mostraste NO tiene una columna
+// "Evaluaciones". Por eso no se debe ejecutar:
+// UPDATE Terceros SET Evaluaciones = ...
+//
+// La clasificación debe persistirse posteriormente en:
+// Relacion_Terceros
+// Formulario_Clasificacion_Terceros
+// Matriz_Riesgos_Resultados
+//
+// Por ahora verificamos que el tercero exista.
+// ================================================================
+
+app.post(
+  '/api/clasificacion',
+  async (req, res) => {
+
+    try {
+
+      if (!pool || !pool.connected) {
+
+        return res.status(503).json({
+
+          ok: false,
+
+          error:
+            'No hay conexión a base de datos'
+
+        });
+
+      }
+
+      const tercero =
+        req.body.tercero || {};
+
+      const evaluaciones =
+        req.body.evaluaciones || [];
+
+      const nit =
+        tercero.nit ||
+        tercero.NIT;
+
+      if (!nit) {
+
+        return res.status(400).json({
+
+          ok: false,
+
+          error:
+            'NIT del tercero es obligatorio'
+
+        });
+
+      }
+
+      const request =
+        new sql.Request(pool);
+
+      request.input(
+        'nit',
+        sql.NVarChar(50),
+        nit
+      );
+
+      const result =
+        await request.query(`
+
+          SELECT
+
+            NIT,
+
+            Nombre_Tercero
+
+          FROM dbo.Terceros
+
+          WHERE NIT = @nit
+
+        `);
+
+      if (
+        result.recordset.length === 0
+      ) {
+
+        return res.status(404).json({
+
+          ok: false,
+
+          error:
+            'El tercero no existe',
+
+          nit
+
+        });
+
+      }
+
+      console.log(
+        `📊 Clasificación recibida para ${nit}`
+      );
+
+      console.log(
+        `📊 Evaluaciones recibidas: ${evaluaciones.length}`
+      );
+
+      res.status(200).json({
+
+        ok: true,
+
+        message:
+          'Tercero localizado. Evaluaciones recibidas.',
+
+        nit,
+
+        nombre:
+          result.recordset[0]
+            .Nombre_Tercero,
+
+        evaluaciones_recibidas:
+          evaluaciones.length,
+
+        next_storage:
+          'Relacion_Terceros / Formulario_Clasificacion_Terceros / Matriz_Riesgos_Resultados'
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        '❌ POST /api/clasificacion:',
+        error.message
+      );
+
+      res.status(500).json({
+
+        ok: false,
+
+        error:
+          error.message
+
+      });
+
+    }
+
+  }
+);
+
+// ================================================================
+// ARCHIVOS ESTÁTICOS
+// ================================================================
+
+// Sirve la estructura histórica sin obligar a mover carpetas.
+// En algunos despliegues el frontend está en public/; en este paquete está en ../frontend.
+const SGRT_STATIC_DIRS = [
+  path.join(__dirname, 'public'),
+  path.join(__dirname, '..', 'frontend'),
+  path.join(process.cwd(), 'public'),
+  path.join(process.cwd(), 'frontend')
+].filter((dir,index,arr)=>arr.indexOf(dir)===index && fs.existsSync(dir));
+SGRT_STATIC_DIRS.forEach(dir=>app.use(express.static(dir)));
+
+// ================================================================
+// BUSCAR INDEX
+// ================================================================
+
+function findIndexHtml() {
+
+  const possiblePaths = [
+
+    path.join(
+      __dirname,
+      'public',
+      'Index.html'
+    ),
+
+    path.join(
+      __dirname,
+      'public',
+      'index.html'
+    ),
+
+    path.join(
+      __dirname,
+      'Index.html'
+    ),
+
+    path.join(
+      __dirname,
+      'index.html'
+    ),
+
+    path.join(__dirname, '..', 'frontend', 'index.html'),
+    path.join(process.cwd(), 'frontend', 'index.html'),
+
+    '/home/site/wwwroot/Index.html',
+
+    '/home/site/wwwroot/public/Index.html'
+
+  ];
+
+  for (
+    const filePath of possiblePaths
+  ) {
+
+    try {
+
+      if (
+        fs.existsSync(filePath)
+      ) {
+
+        console.log(
+          `✅ Index encontrado: ${filePath}`
+        );
+
+        return filePath;
+
+      }
+
+    } catch (error) {
+
+      // continuar
+
+    }
+
+  }
+
+  return null;
+
+}
+
+// ================================================================
+// INICIO
+// ================================================================
+
+app.get('/', (req, res) => {
+
+  const indexPath =
+    findIndexHtml();
+
+  if (!indexPath) {
+
+    return res.status(500).json({
+
+      ok: false,
+
+      error:
+        'No se encontró Index.html'
+
+    });
+
+  }
+
+  res.sendFile(
+    indexPath,
+    error => {
+
+      if (error) {
+
+        console.error(
+          '❌ Error sirviendo Index:',
+          error.message
+        );
+
+      }
+
+    }
+  );
+
+});
+
+
+// ================================================================
+// SHAREPOINT / MICROSOFT GRAPH — REPOSITORIO DOCUMENTAL SGRT
+// ================================================================
+// Ruta vinculada solicitada:
+// https://iseguras.sharepoint.com/sites/Consultoria/Proyectos%20Actuales/Prueba%20-%20APP%20-%20SGRT
+//
+// Variables requeridas en Azure App Service:
+// SHAREPOINT_TENANT_ID
+// SHAREPOINT_CLIENT_ID
+// SHAREPOINT_CLIENT_SECRET
+// Opcionales (ya tienen valores por defecto para este proyecto):
+// SHAREPOINT_HOST, SHAREPOINT_SITE_PATH, SHAREPOINT_ROOT_PATH, SHAREPOINT_ROOT_WEB_URL
+
+const SP_CFG = {
+  tenantId: process.env.SHAREPOINT_TENANT_ID || process.env.AZURE_TENANT_ID || '',
+  clientId: process.env.SHAREPOINT_CLIENT_ID || '',
+  clientSecret: process.env.SHAREPOINT_CLIENT_SECRET || '',
+  host: process.env.SHAREPOINT_HOST || 'iseguras.sharepoint.com',
+  sitePath: process.env.SHAREPOINT_SITE_PATH || '/sites/Consultoria',
+  rootPath: process.env.SHAREPOINT_ROOT_PATH || '/Proyectos Actuales/Prueba - APP - SGRT',
+  rootWebUrl: process.env.SHAREPOINT_ROOT_WEB_URL || 'https://iseguras.sharepoint.com/sites/Consultoria/Proyectos%20Actuales/Prueba%20-%20APP%20-%20SGRT'
+};
+
+let spTokenCache = { token: '', expiresAt: 0 };
+let spContextCache = { value: null, expiresAt: 0 };
+
+function spConfigured(){
+  return !!(SP_CFG.tenantId && SP_CFG.clientId && SP_CFG.clientSecret);
+}
+
+function spHttp(url, method='GET', headers={}, body=null){
+  return new Promise((resolve,reject)=>{
+    const u = new URL(url);
+    const opts = {
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method,
+      headers: Object.assign({}, headers)
+    };
+    if(body && !Buffer.isBuffer(body)) body = Buffer.from(String(body));
+    if(body) opts.headers['Content-Length'] = Buffer.byteLength(body);
+    const req = https.request(opts, r=>{
+      const chunks=[];
+      r.on('data',c=>chunks.push(c));
+      r.on('end',()=>{
+        const buf=Buffer.concat(chunks);
+        const txt=buf.toString('utf8');
+        let data=txt;
+        const ct=String(r.headers['content-type']||'');
+        if(ct.includes('application/json') || (txt && /^[\[{]/.test(txt.trim()))){
+          try{data=JSON.parse(txt);}catch(e){}
+        }
+        if(r.statusCode>=200 && r.statusCode<300) return resolve({status:r.statusCode,headers:r.headers,data,buffer:buf});
+        const err=new Error((data&&data.error&&data.error.message)||txt||('HTTP '+r.statusCode));
+        err.status=r.statusCode; err.data=data; reject(err);
+      });
+    });
+    req.on('error',reject);
+    if(body) req.write(body);
+    req.end();
+  });
+}
+
+async function spAccessToken(){
+  if(!spConfigured()) throw new Error('SharePoint no está configurado en las variables de entorno');
+  if(spTokenCache.token && Date.now() < spTokenCache.expiresAt-60000) return spTokenCache.token;
+  const form = new URLSearchParams({
+    client_id: SP_CFG.clientId,
+    client_secret: SP_CFG.clientSecret,
+    scope: 'https://graph.microsoft.com/.default',
+    grant_type: 'client_credentials'
+  }).toString();
+  const r = await spHttp(
+    `https://login.microsoftonline.com/${encodeURIComponent(SP_CFG.tenantId)}/oauth2/v2.0/token`,
+    'POST',
+    {'Content-Type':'application/x-www-form-urlencoded'},
+    form
+  );
+  if(!r.data || !r.data.access_token) throw new Error('Microsoft Entra no devolvió access_token');
+  spTokenCache={token:r.data.access_token,expiresAt:Date.now()+Number(r.data.expires_in||3600)*1000};
+  return spTokenCache.token;
+}
+
+async function spGraph(pathName, method='GET', body=null, contentType='application/json'){
+  const token=await spAccessToken();
+  let payload=body;
+  const headers={Authorization:'Bearer '+token};
+  if(body!==null && body!==undefined){
+    if(contentType==='application/json' && !Buffer.isBuffer(body)) payload=JSON.stringify(body);
+    headers['Content-Type']=contentType;
+  }
+  return spHttp('https://graph.microsoft.com/v1.0'+pathName,method,headers,payload);
+}
+
+function spSafeRel(v){
+  return String(v||'').replace(/\\/g,'/').split('/').filter(Boolean).filter(x=>x!=='.'&&x!=='..').join('/');
+}
+function spEncodePath(v){
+  return String(v||'').split('/').filter(Boolean).map(encodeURIComponent).join('/');
+}
+function spFullPath(rel){
+  const root=spSafeRel(SP_CFG.rootPath), child=spSafeRel(rel);
+  return child ? root+'/'+child : root;
+}
+
+async function spContext(force=false){
+  if(!force && spContextCache.value && Date.now()<spContextCache.expiresAt) return spContextCache.value;
+  const site = (await spGraph(`/sites/${SP_CFG.host}:${SP_CFG.sitePath}`)).data;
+  const drive = (await spGraph(`/sites/${encodeURIComponent(site.id)}/drive`)).data;
+  const full=spFullPath('');
+  const root = (await spGraph(`/drives/${encodeURIComponent(drive.id)}/root:/${spEncodePath(full)}`)).data;
+  const ctx={siteId:site.id,driveId:drive.id,rootItemId:root.id,rootWebUrl:root.webUrl||SP_CFG.rootWebUrl,rootName:root.name||'Prueba - APP - SGRT'};
+  spContextCache={value:ctx,expiresAt:Date.now()+5*60*1000};
+  return ctx;
+}
+
+async function spItemByRel(rel){
+  const ctx=await spContext();
+  const full=spFullPath(rel);
+  return (await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/root:/${spEncodePath(full)}`)).data;
+}
+
+async function spEnsureFolder(rel){
+  const ctx=await spContext();
+  const segs=spSafeRel(rel).split('/').filter(Boolean);
+  let built=''; let parent={id:ctx.rootItemId,name:ctx.rootName,webUrl:ctx.rootWebUrl,folder:{}};
+  for(const seg of segs){
+    built=built?built+'/'+seg:seg;
+    try{ parent=await spItemByRel(built); continue; }
+    catch(e){ if(e.status!==404) throw e; }
+    const created=(await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(parent.id)}/children`,'POST',{
+      name:seg, folder:{}, '@microsoft.graph.conflictBehavior':'fail'
+    })).data;
+    parent=created;
+  }
+  return parent;
+}
+
+app.get('/api/sharepoint/status', async (req,res)=>{
+  const base={ok:true,configured:spConfigured(),rootWebUrl:SP_CFG.rootWebUrl,sitePath:SP_CFG.sitePath,rootPath:SP_CFG.rootPath};
+  if(!spConfigured()) return res.json(base);
+  try{const c=await spContext();return res.json(Object.assign(base,{connected:true,driveId:c.driveId,rootItemId:c.rootItemId,rootWebUrl:c.rootWebUrl}));}
+  catch(e){return res.status(503).json(Object.assign(base,{connected:false,error:e.message}));}
+});
+
+app.get('/api/sharepoint/list', async (req,res)=>{
+  try{
+    const rel=spSafeRel(req.query.path||'');
+    const ctx=await spContext();
+    const current=rel?await spItemByRel(rel):await spItemByRel('');
+    const r=await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(current.id)}/children?$select=id,name,size,webUrl,lastModifiedDateTime,folder,file,parentReference`);
+    const items=(r.data&&r.data.value||[]).map(x=>({id:x.id,name:x.name,type:x.folder?'folder':'file',size:x.size||0,webUrl:x.webUrl||'',modified:x.lastModifiedDateTime||'',folder:!!x.folder,file:!!x.file}));
+    res.json({ok:true,path:rel,current:{id:current.id,name:current.name,webUrl:current.webUrl||'',type:current.folder?'folder':'file'},items});
+  }catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.post('/api/sharepoint/ensure-folder', async (req,res)=>{
+  try{const rel=spSafeRel(req.body&&req.body.path||'');const item=await spEnsureFolder(rel);res.json({ok:true,item:{id:item.id,name:item.name,webUrl:item.webUrl||''}});}
+  catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.post('/api/sharepoint/folder', async (req,res)=>{
+  try{
+    const rel=spSafeRel(req.body&&req.body.path||''); const name=String(req.body&&req.body.name||'').trim();
+    if(!name) return res.status(400).json({ok:false,error:'Nombre requerido'});
+    const ctx=await spContext(); const parent=rel?await spItemByRel(rel):await spItemByRel('');
+    const item=(await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(parent.id)}/children`,'POST',{name,folder:{},'@microsoft.graph.conflictBehavior':'rename'})).data;
+    res.json({ok:true,item:{id:item.id,name:item.name,webUrl:item.webUrl||''}});
+  }catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.post('/api/sharepoint/upload', async (req,res)=>{
+  try{
+    const rel=spSafeRel(req.body&&req.body.path||''); const name=String(req.body&&req.body.name||'').trim();
+    const b64=String(req.body&&req.body.contentBase64||''); const mime=String(req.body&&req.body.mimeType||'application/octet-stream');
+    if(!name||!b64) return res.status(400).json({ok:false,error:'Archivo incompleto'});
+    const ctx=await spContext(); const full=spFullPath((rel?rel+'/':'')+name); const buffer=Buffer.from(b64,'base64');
+    const item=(await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/root:/${spEncodePath(full)}:/content`,'PUT',buffer,mime)).data;
+    res.json({ok:true,item:{id:item.id,name:item.name,webUrl:item.webUrl||'',size:item.size||buffer.length}});
+  }catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.patch('/api/sharepoint/item/:itemId', async (req,res)=>{
+  try{const ctx=await spContext();const name=String(req.body&&req.body.name||'').trim();if(!name)return res.status(400).json({ok:false,error:'Nombre requerido'});const item=(await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(req.params.itemId)}`,'PATCH',{name})).data;res.json({ok:true,item:{id:item.id,name:item.name,webUrl:item.webUrl||''}});}
+  catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.delete('/api/sharepoint/item/:itemId', async (req,res)=>{
+  try{const ctx=await spContext();await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(req.params.itemId)}`,'DELETE');res.json({ok:true});}
+  catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+function spRequireSuperadmin(req,res){ if(String(req.headers['x-sgrt-superadmin']||'')!=='1'){res.status(403).json({ok:false,error:'Solo el Superadministrador puede gestionar permisos'});return false;}return true;}
+
+app.get('/api/sharepoint/permissions/:itemId', async (req,res)=>{
+  if(!spRequireSuperadmin(req,res)) return;
+  try{const ctx=await spContext();const r=await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(req.params.itemId)}/permissions`);const list=(r.data&&r.data.value||[]).map(p=>({id:p.id,roles:p.roles||[],grantedToV2:p.grantedToV2||null,grantedToIdentitiesV2:p.grantedToIdentitiesV2||null,link:p.link||null,invitation:p.invitation||null}));res.json({ok:true,permissions:list});}
+  catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.post('/api/sharepoint/permissions/:itemId', async (req,res)=>{
+  if(!spRequireSuperadmin(req,res)) return;
+  try{
+    const ctx=await spContext(); const email=String(req.body&&req.body.email||'').trim(); const role=String(req.body&&req.body.role||'read').toLowerCase()==='write'?'write':'read';
+    if(!email) return res.status(400).json({ok:false,error:'Correo requerido'});
+    const r=await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(req.params.itemId)}/invite`,'POST',{
+      recipients:[{email}],message:'Acceso al repositorio documental SGRT',requireSignIn:true,sendInvitation:false,roles:[role]
+    });
+    res.json({ok:true,permissions:r.data&&r.data.value||[]});
+  }catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+app.delete('/api/sharepoint/permissions/:itemId/:permissionId', async (req,res)=>{
+  if(!spRequireSuperadmin(req,res)) return;
+  try{const ctx=await spContext();await spGraph(`/drives/${encodeURIComponent(ctx.driveId)}/items/${encodeURIComponent(req.params.itemId)}/permissions/${encodeURIComponent(req.params.permissionId)}`,'DELETE');res.json({ok:true});}
+  catch(e){res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+
+// ================================================================
+// POWER BI EMBEDDED — REPORTE SGRT SIN LOGIN MICROSOFT POR USUARIO
+// ================================================================
+// Implementa el patrón "Embed for your customers / App owns data".
+// Los secretos permanecen exclusivamente en el backend.
+//
+// Variables recomendadas en Azure App Service:
+//   POWERBI_TENANT_ID
+//   POWERBI_CLIENT_ID
+//   POWERBI_CLIENT_SECRET
+//   POWERBI_WORKSPACE_ID          (opcional: también puede sincronizarse desde el SGRT)
+//   POWERBI_REPORT_ID             (opcional: también puede sincronizarse desde el SGRT)
+//
+// Si POWERBI_TENANT_ID / CLIENT_ID / CLIENT_SECRET no existen, se intentan
+// reutilizar SHAREPOINT_TENANT_ID / SHAREPOINT_CLIENT_ID /
+// SHAREPOINT_CLIENT_SECRET. Esa aplicación de Entra debe tener acceso a la
+// API de Power BI y estar agregada al workspace correspondiente.
+
+const PBI_CFG = {
+  tenantId: process.env.POWERBI_TENANT_ID || process.env.SHAREPOINT_TENANT_ID || process.env.AZURE_TENANT_ID || '',
+  clientId: process.env.POWERBI_CLIENT_ID || process.env.SHAREPOINT_CLIENT_ID || '',
+  clientSecret: process.env.POWERBI_CLIENT_SECRET || process.env.SHAREPOINT_CLIENT_SECRET || '',
+  workspaceId: process.env.POWERBI_WORKSPACE_ID || '',
+  reportId: process.env.POWERBI_REPORT_ID || '',
+  embedUrl: process.env.POWERBI_EMBED_URL || ''
+};
+
+const PBI_CONFIG_DIR = process.env.POWERBI_CONFIG_DIR || (process.env.HOME ? path.join(process.env.HOME, 'data') : path.join(__dirname, 'data'));
+const PBI_CONFIG_FILE = path.join(PBI_CONFIG_DIR, 'sgrt-powerbi-report.json');
+let pbiAadTokenCache = { token: '', expiresAt: 0 };
+let pbiEmbedTokenCache = { key: '', token: '', expiration: '', expiresAt: 0 };
+
+function pbiCleanId(v){
+  const s=String(v||'').trim();
+  return /^[0-9a-fA-F-]{20,80}$/.test(s) ? s : '';
+}
+
+function pbiParseEmbedUrl(raw){
+  let v=String(raw||'').trim();
+  if(!v) return null;
+  const iframe=v.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+  if(iframe&&iframe[1]) v=iframe[1].replace(/&amp;/g,'&');
+  try{
+    const u=new URL(v);
+    let workspaceId=pbiCleanId(u.searchParams.get('groupId'));
+    let reportId=pbiCleanId(u.searchParams.get('reportId'));
+    if(!workspaceId||!reportId){
+      const m=u.pathname.match(/\/groups\/([^\/?#]+)\/reports\/([^\/?#]+)/i);
+      if(m){workspaceId=pbiCleanId(m[1]);reportId=pbiCleanId(m[2]);}
+    }
+    if(!workspaceId||!reportId) return null;
+    return {
+      workspaceId,
+      reportId,
+      embedUrl:`https://app.powerbi.com/reportEmbed?reportId=${encodeURIComponent(reportId)}&groupId=${encodeURIComponent(workspaceId)}`
+    };
+  }catch(e){return null;}
+}
+
+function pbiReadSavedConfig(){
+  try{
+    if(!fs.existsSync(PBI_CONFIG_FILE)) return null;
+    const data=JSON.parse(fs.readFileSync(PBI_CONFIG_FILE,'utf8'));
+    const embedUrl=String(data.embedUrl||'').trim();
+    const workspaceId=pbiCleanId(data.workspaceId), reportId=pbiCleanId(data.reportId);
+    if(workspaceId&&reportId) return {workspaceId,reportId,embedUrl,updatedAt:data.updatedAt||'',public:false};
+    // Permite conservar un vínculo "Publicar en web" (view?r=...) como fallback.
+    // No genera embed token; se muestra directamente en iframe.
+    if(/^https:\/\/app\.powerbi\.com\/view\?/i.test(embedUrl))
+      return {workspaceId:'',reportId:'',embedUrl,updatedAt:data.updatedAt||'',public:true};
+    return null;
+  }catch(e){
+    console.warn('⚠️ Power BI: no se pudo leer configuración persistida:',e.message);
+    return null;
+  }
+}
+
+function pbiResolveReportConfig(){
+  const envUrl=pbiParseEmbedUrl(PBI_CFG.embedUrl);
+  const envWorkspace=pbiCleanId(PBI_CFG.workspaceId), envReport=pbiCleanId(PBI_CFG.reportId);
+  if(envWorkspace&&envReport){
+    return {workspaceId:envWorkspace,reportId:envReport,embedUrl:(envUrl&&envUrl.embedUrl)||`https://app.powerbi.com/reportEmbed?reportId=${encodeURIComponent(envReport)}&groupId=${encodeURIComponent(envWorkspace)}`,source:'environment'};
+  }
+  if(envUrl) return Object.assign({},envUrl,{source:'environment'});
+  const saved=pbiReadSavedConfig();
+  return saved?Object.assign({},saved,{source:'server'}):null;
+}
+
+function pbiSaveReportConfig(cfg){
+  const workspaceId=pbiCleanId(cfg&&cfg.workspaceId), reportId=pbiCleanId(cfg&&cfg.reportId);
+  const embedUrl=String(cfg&&cfg.embedUrl||'').trim() || (workspaceId&&reportId?`https://app.powerbi.com/reportEmbed?reportId=${encodeURIComponent(reportId)}&groupId=${encodeURIComponent(workspaceId)}`:'');
+  const isPublic=/^https:\/\/app\.powerbi\.com\/view\?/i.test(embedUrl);
+  if((!workspaceId||!reportId)&&!isPublic) throw new Error('Enlace Power BI inválido: usa reportEmbed/workspace o view?r=');
+  fs.mkdirSync(PBI_CONFIG_DIR,{recursive:true});
+  const payload={workspaceId:workspaceId||'',reportId:reportId||'',embedUrl,public:isPublic,updatedAt:new Date().toISOString()};
+  fs.writeFileSync(PBI_CONFIG_FILE,JSON.stringify(payload,null,2),'utf8');
+  pbiEmbedTokenCache={key:'',token:'',expiration:'',expiresAt:0};
+  return payload;
+}
+
+function pbiCredentialsConfigured(){
+  return !!(PBI_CFG.tenantId&&PBI_CFG.clientId&&PBI_CFG.clientSecret);
+}
+
+async function pbiAadAccessToken(){
+  if(!pbiCredentialsConfigured()) throw new Error('Power BI Embedded no tiene credenciales de Entra configuradas');
+  if(pbiAadTokenCache.token && Date.now()<pbiAadTokenCache.expiresAt-60000) return pbiAadTokenCache.token;
+  const form=new URLSearchParams({
+    client_id:PBI_CFG.clientId,
+    client_secret:PBI_CFG.clientSecret,
+    scope:'https://analysis.windows.net/powerbi/api/.default',
+    grant_type:'client_credentials'
+  }).toString();
+  const r=await spHttp(
+    `https://login.microsoftonline.com/${encodeURIComponent(PBI_CFG.tenantId)}/oauth2/v2.0/token`,
+    'POST',
+    {'Content-Type':'application/x-www-form-urlencoded'},
+    form
+  );
+  if(!r.data||!r.data.access_token) throw new Error('Microsoft Entra no devolvió token para Power BI');
+  pbiAadTokenCache={token:r.data.access_token,expiresAt:Date.now()+Number(r.data.expires_in||3600)*1000};
+  return pbiAadTokenCache.token;
+}
+
+async function pbiApi(pathName,method='GET',body=null){
+  const token=await pbiAadAccessToken();
+  const headers={Authorization:'Bearer '+token};
+  let payload=null;
+  if(body!==null&&body!==undefined){headers['Content-Type']='application/json';payload=JSON.stringify(body);}
+  return spHttp('https://api.powerbi.com/v1.0/myorg'+pathName,method,headers,payload);
+}
+
+function pbiRoleAllowed(req){
+  const role=String(req.headers['x-sgrt-role']||'').toLowerCase();
+  return (role.includes('administrador') && role.includes('riesgo')) || role.includes('super');
+}
+
+
+app.get('/api/powerbi/status', async (req,res)=>{
+  const report=pbiResolveReportConfig();
+  res.json({
+    ok:true,
+    embeddedConfigured:pbiCredentialsConfigured(),
+    reportConfigured:!!report,
+    report:report?{workspaceId:report.workspaceId,reportId:report.reportId,embedUrl:report.embedUrl,source:report.source}:null,
+    credentialsSource:(process.env.POWERBI_CLIENT_ID?'POWERBI_*':(process.env.SHAREPOINT_CLIENT_ID?'SHAREPOINT_*':'none'))
+  });
+});
+
+app.get('/api/powerbi/report-config', (req,res)=>{
+  const report=pbiResolveReportConfig();
+  if(!report) return res.status(404).json({ok:false,code:'POWERBI_REPORT_NOT_CONFIGURED',error:'No hay reporte Power BI configurado en el servidor'});
+  res.json({ok:true,workspaceId:report.workspaceId,reportId:report.reportId,embedUrl:report.embedUrl,source:report.source});
+});
+
+app.post('/api/powerbi/report-config', (req,res)=>{
+  if(!pbiRoleAllowed(req)) return res.status(403).json({ok:false,error:'Rol no autorizado para configurar Power BI'});
+  try{
+    // Si Azure define IDs por variables de entorno, esa configuración es la autoridad.
+    if(pbiCleanId(PBI_CFG.workspaceId)&&pbiCleanId(PBI_CFG.reportId)){
+      const fixed=pbiResolveReportConfig();
+      return res.json({ok:true,locked:true,workspaceId:fixed.workspaceId,reportId:fixed.reportId,embedUrl:fixed.embedUrl,source:'environment'});
+    }
+    const rawUrl=String(req.body&&req.body.embedUrl||'').trim();
+    const parsed=pbiParseEmbedUrl(rawUrl);
+    const workspaceId=pbiCleanId((req.body&&req.body.workspaceId)||(parsed&&parsed.workspaceId));
+    const reportId=pbiCleanId((req.body&&req.body.reportId)||(parsed&&parsed.reportId));
+    const saved=pbiSaveReportConfig({workspaceId,reportId,embedUrl:(parsed&&parsed.embedUrl)||rawUrl});
+    res.json({ok:true,workspaceId:saved.workspaceId,reportId:saved.reportId,embedUrl:saved.embedUrl,public:!!saved.public,source:'server'});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.get('/api/powerbi/embed-config', async (req,res)=>{
+  if(!pbiRoleAllowed(req)) return res.status(403).json({ok:false,error:'Rol no autorizado para visualizar Power BI'});
+  const cfg=pbiResolveReportConfig();
+  if(!cfg) return res.status(409).json({ok:false,code:'POWERBI_REPORT_NOT_CONFIGURED',error:'Configura una vez el reporte Power BI desde el SGRT'});
+  if(cfg.public) return res.json({ok:true,type:'public',embedUrl:cfg.embedUrl,public:true});
+  if(!pbiCredentialsConfigured()) return res.status(503).json({ok:false,code:'POWERBI_SERVICE_PRINCIPAL_NOT_CONFIGURED',error:'Faltan credenciales de Power BI Embedded en Azure App Service'});
+  try{
+    const key=cfg.workspaceId+'|'+cfg.reportId;
+    if(pbiEmbedTokenCache.key===key && pbiEmbedTokenCache.token && Date.now()<pbiEmbedTokenCache.expiresAt-5*60*1000){
+      return res.json({ok:true,type:'report',reportId:cfg.reportId,workspaceId:cfg.workspaceId,embedUrl:cfg.embedUrl,accessToken:pbiEmbedTokenCache.token,expiration:pbiEmbedTokenCache.expiration,cached:true});
+    }
+    const reportResp=await pbiApi(`/groups/${encodeURIComponent(cfg.workspaceId)}/reports/${encodeURIComponent(cfg.reportId)}`);
+    const report=reportResp.data||{};
+    const tokenResp=await pbiApi(`/groups/${encodeURIComponent(cfg.workspaceId)}/reports/${encodeURIComponent(cfg.reportId)}/GenerateToken`,'POST',{accessLevel:'View'});
+    const tokenData=tokenResp.data||{};
+    if(!tokenData.token) throw new Error('Power BI no devolvió el embed token');
+    const expiration=tokenData.expiration||new Date(Date.now()+50*60*1000).toISOString();
+    const expiresAt=Date.parse(expiration)||Date.now()+50*60*1000;
+    pbiEmbedTokenCache={key,token:tokenData.token,expiration,expiresAt};
+    res.json({
+      ok:true,
+      type:'report',
+      reportId:cfg.reportId,
+      workspaceId:cfg.workspaceId,
+      embedUrl:report.embedUrl||cfg.embedUrl,
+      accessToken:tokenData.token,
+      expiration,
+      cached:false
+    });
+  }catch(e){
+    console.error('❌ Power BI Embedded:',e.message);
+    const detail=e&&e.data&&typeof e.data==='object'?e.data:undefined;
+    res.status(e.status||502).json({ok:false,code:'POWERBI_EMBED_ERROR',error:e.message,detail});
+  }
+});
+
+
+
+// ================================================================
+// ASISTENTE SGRT / DOCUMENTOS / TRANSCRIPCION DE REUNIONES (OPCIONAL)
+// ================================================================
+// Las claves NUNCA se guardan en el frontend ni en GitHub.
+// Proveedor recomendado para piloto: Gemini (puede tener nivel gratuito sujeto
+// a los limites vigentes de Google AI Studio). Tambien se conserva OpenAI como
+// proveedor opcional. Configura las variables en Azure App Service.
+const AI_CFG = {
+  provider: String(process.env.AI_PROVIDER || 'auto').trim().toLowerCase(),
+  geminiApiKey: String(process.env.GEMINI_API_KEY || '').trim(),
+  geminiModel: String(process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim(),
+  openaiApiKey: String(process.env.OPENAI_API_KEY || '').trim(),
+  openaiModel: String(process.env.OPENAI_MODEL || 'gpt-5.6-luna').trim(),
+  openaiReasoningEffort: String(process.env.OPENAI_REASONING_EFFORT || 'low').trim().toLowerCase(),
+  openaiTranscriptionModel: String(process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-transcribe').trim(),
+  // Modelos de imagen configurables desde Azure App Service. Los valores por defecto
+  // siguen las APIs oficiales vigentes; si tu cuenta usa otro modelo, basta con
+  // sobreescribir GEMINI_IMAGE_MODEL u OPENAI_IMAGE_MODEL sin tocar el código.
+  geminiImageModel: String(process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image').trim(),
+  openaiImageModel: String(process.env.OPENAI_IMAGE_MODEL || 'gpt-image-2').trim(),
+  webGrounding: String(process.env.AI_WEB_GROUNDING || 'true').trim().toLowerCase() !== 'false'
+};
+
+function aiProvider(){
+  if(AI_CFG.provider === 'gemini') return AI_CFG.geminiApiKey ? 'gemini' : 'none';
+  if(AI_CFG.provider === 'openai') return AI_CFG.openaiApiKey ? 'openai' : 'none';
+  // En modo auto la conversación usa OpenAI como principal y Gemini como respaldo.
+  if(AI_CFG.openaiApiKey) return 'openai';
+  if(AI_CFG.geminiApiKey) return 'gemini';
+  return 'none';
+}
+function aiConfigured(){ return aiProvider() !== 'none'; }
+function aiModel(){ return aiProvider()==='gemini' ? AI_CFG.geminiModel : (aiProvider()==='openai' ? AI_CFG.openaiModel : ''); }
+
+async function aiFetchJson(url, options){
+  if(typeof fetch!=='function') throw new Error('El servidor requiere Node 18+ para el asistente');
+  const r=await fetch(url,options); let data={};
+  try{ data=await r.json(); }catch(e){}
+  if(!r.ok){
+    const detail=data&&data.error&&(data.error.message||data.error)||data.message||('HTTP '+r.status);
+    const er=new Error(String(detail)); er.status=r.status; throw er;
+  }
+  return data;
+}
+
+function aiHistoryText(history){
+  if(!Array.isArray(history)) return '';
+  return history.slice(-10).map(item=>{
+    const role=String(item&&item.role||'user').toLowerCase()==='assistant'?'Asistente':'Usuario';
+    const content=String(item&&item.content||'').trim();
+    return content ? role+': '+content.slice(0,3000) : '';
+  }).filter(Boolean).join('\n');
+}
+
+function aiInstruction(prompt,context,history){
+  const previous=aiHistoryText(history);
+  return [
+    'Eres el Asistente Inteligente SGRT de Infraestructuras Seguras. Tu prioridad es ayudar dentro del Sistema de Gestion de Riesgos de Terceros (SGRT) y en conceptos directamente relacionados con gestion de riesgos, control interno, terceros, contratos, controles, evidencias, cumplimiento, continuidad, ciberseguridad y tecnologia cuando tenga relacion con riesgo.',
+    'ALCANCE ESTRICTO: no respondas preguntas de cultura general, geografia, entretenimiento, deportes, politica, celebridades, recetas, ocio ni otros temas externos al SGRT o a la gestion de riesgos. Si la pregunta esta fuera de alcance, no la contestes: indica brevemente que estas especializado en SGRT y gestion de riesgos y ofrece ejemplos de preguntas que si puedes resolver.',
+    'Conversacion natural: si el usuario saluda o pregunta como estas, responde como una conversacion normal, por ejemplo “Hola, muy bien, gracias por preguntar. ¿Como estas tu?” o una variante natural. En saludos no menciones de inmediato el rol, el modulo, porcentajes ni herramientas salvo que el usuario lo pida. Despues puedes ofrecer ayuda con el SGRT de forma breve y natural. Un saludo no abre el alcance a temas externos.',
+    'Interpreta errores ortograficos evidentes, palabras incompletas y formas coloquiales sin castigar al usuario. Por ejemplo, “riegso” debe entenderse como “riesgo” si el contexto lo hace claro, y “dimension” o “dimensión” puede referirse a una dimension/tipologia del SGRT. Si la intencion es clara, responde directamente; no devuelvas un mensaje de fuera de alcance por un simple typo.',
+    'Evita sonar como menu o robot. No conviertas cada turno en una lista de funciones. Si la pregunta es sencilla, responde en una o dos frases y deja que la conversacion avance. Usa secciones, botones conceptuales o pasos solo cuando realmente ayuden.',
+    'Prioriza responder la pregunta actual antes de ofrecer herramientas. En una conversacion ordinaria, contesta primero de forma natural y breve; no repitas en cada turno que estas especializado en SGRT. Solo menciona el limite de alcance cuando la solicitud sea realmente externa.',
+    'Regla de intencion: responde exactamente a lo que el usuario dijo, no a una pregunta social que no hizo. Si escribe solo “hola”, saluda y pregunta en que puedes ayudar dentro del SGRT; NO digas “estoy bien” porque no te preguntaron como estas. Si escribe “hola, como estas”, entonces si responde como estas y continua la conversacion de forma breve.',
+    'Cuando el usuario diga “no entiendo”, “explicamelo facil”, “no se que significa” o muestre confusion, comienza de forma humana con una frase breve como “Claro, yo te lo explico facil”, “Tranquila, vamos paso a paso” o “Claro, miremoslo en sencillo”. No uses siempre la misma frase; varia de forma natural.',
+    'Para definiciones del dominio usa este patron conversacional, sin convertirlo en plantilla visible: 1) explicacion sencilla en una frase, 2) ejemplo corto aplicado a una empresa o tercero, 3) relacion practica con el SGRT solo si aporta valor. No uses jerga antes de explicarla.',
+    'Ejemplo de estilo para “que es un tercero”: “Claro. Un tercero puede ser un proveedor, contratista o empresa externa con la que trabaja la organizacion. Aunque no pertenezca directamente a la empresa, sus fallas pueden generar impactos operacionales, financieros, de seguridad o cumplimiento. Por eso el SGRT permite evaluarlo y hacer seguimiento a sus controles.” No repitas este texto mecanicamente; conserva su claridad y tono.',
+    'Ejemplo de estilo para “no entiendo que es un riesgo”: “Claro, yo te lo explico facil. En terminos sencillos, un riesgo es una situacion incierta que podria afectar un objetivo de la empresa. Por ejemplo, si un proveedor critico deja de operar, la organizacion podria interrumpir un servicio. En el SGRT ese riesgo se identifica, se valora y se revisan los controles que ayudan a reducirlo.”',
+    'Si preguntan “que es un contrato” en este contexto, explica que es el acuerdo que vincula a la organizacion con un tercero y que en el SGRT sirve para separar alcance, tipologias, controles, evidencias, riesgos y seguimiento. Aclara que un mismo tercero puede tener varios contratos con evaluaciones diferentes.',
+    'Si preguntan “que son los controles”, primero explica que son medidas para prevenir, detectar o reducir un riesgo; despues, si el contexto contiene controles reales, menciona los que correspondan. No inventes controles que no esten en los datos internos cuando la pregunta sea sobre una evaluacion concreta.',
+    'Si preguntan “por que este tercero quedo en alto riesgo”, analiza SOLO los datos internos recibidos: puntajes, tipologias, respuestas, riesgos, probabilidades, impactos y controles visibles. Explica los factores que realmente aparecen. Si faltan datos para justificar la clasificacion, dilo claramente y señala que modulo revisar.',
+    'Si preguntan “que me falta diligenciar”, usa resumenSistema y dimensiones para listar pendientes concretos por modulo, tercero, contrato o tipologia cuando esten disponibles. No respondas con una explicacion generica si el contexto permite identificar faltantes.',
+    'Si adjuntan un PDF/Word/Excel y piden compararlo con una evaluacion, primero resume brevemente que contiene el archivo, luego compara requisito por requisito con los datos internos disponibles, marca coincidencias, diferencias, faltantes y evidencias recomendadas. No inventes contenido ausente del archivo ni del SGRT.',
+    'Si piden “analiza esta evaluacion y dime que deberia revisar”, prioriza respuestas No, controles pendientes, evidencias faltantes, riesgos altos/extremos, tratamientos sin responsable/fecha y contradicciones entre documento y evaluacion. Separa hechos observados de recomendaciones.',
+    'Si piden un resumen ejecutivo, responde con una sintesis lista para gerencia: situacion, hallazgos clave, nivel de avance, riesgos/prioridades y siguientes acciones. Usa solo datos disponibles y deja claro cuando falta informacion.',
+    'Si piden una imagen, infografia, podcast, video, Word, Excel o presentacion, primero confirma en una sola frase que entendiste el objetivo y prepara el contenido. La interfaz se encargara de generar el artefacto; no describas botones ni procesos tecnicos salvo que haya un error.',
+    'Tono humano y cercano: si el usuario expresa tristeza, frustracion, cansancio, estres o sentirse abrumado, reconoce lo que dice con una o dos frases calidas, sin diagnosticar ni dramatizar. Luego ofrece reducir la carga dentro del SGRT: explicar una sola pantalla, ir paso a paso, usar flashcards, un quiz corto o un juego. No afirmes ser una persona real.',
+    'Puedes usar frases naturales como “claro, te acompano con eso”, “podemos verlo paso a paso” o “si quieres, lo hacemos mas sencillo”, sin caer en exceso de afecto ni infantilizar al usuario.',
+    'No conviertas una pregunta normal en un informe, documento, matriz o recomendacion corporativa salvo que el usuario lo solicite o sea claramente necesario para contestar.',
+    'Cuando el usuario pregunte "que es" un concepto del dominio, explicalo primero en lenguaje sencillo y, solo si aporta valor, agrega un ejemplo corto o una relacion con SGRT.',
+    'Para datos internos o actuales del SGRT (terceros, contratos, tipologias, respuestas, porcentajes, evidencias, riesgos, usuarios o resultados) usa exclusivamente el contexto y los archivos suministrados. Si el dato no esta en el contexto, di que no esta disponible en la informacion recibida.',
+    'Para conceptos generales del dominio (por ejemplo que es un riesgo, que es una dimension, gestion de riesgos, ISO 31000, riesgo de terceros, controles o buenas practicas) puedes apoyarte en busqueda web cuando la herramienta este habilitada. Usa fuentes publicas y confiables, explica con tus propias palabras y diferencia claramente la referencia externa de los datos internos del SGRT.',
+    'Nunca uses busqueda web para completar, inferir o revelar datos internos de terceros, NIT, contratos, respuestas, evidencias, usuarios, porcentajes o resultados del SGRT. Esos datos salen solamente del contexto y archivos suministrados.',
+    'El contexto puede incluir moduloActual, catalogoModulos y resumenSistema. Usa esos campos para actuar como copiloto de navegacion: si preguntan donde encontrar algo, menciona el nombre exacto de un modulo existente y explica en una frase por que. Nunca inventes una pantalla o modulo que no aparezca en catalogoModulos.',
+    'Si el usuario dice que no entiende el sistema, pide ayuda para usarlo, pregunta que hace aqui o cual es el siguiente paso, responde como guia por rol: empieza indicando en negrita su rol y el modulo actual, explica que se hace ahi, luego da una ruta de 3 a 7 pasos usando exclusivamente nombres reales de catalogoModulos y termina con una accion concreta para hacer ahora. No respondas de forma generica.',
+    'En esas guias usa Markdown legible: titulo corto, palabras clave en **negrita**, pasos numerados y nombres exactos de modulos. Si un modulo no existe en catalogoModulos, no lo inventes.',
+    'Si el usuario pregunta por hojas de vida, expedientes, soportes o archivos y no existe un modulo con ese nombre exacto, dilo con claridad y orienta al modulo real mas cercano segun catalogoModulos, normalmente Documentacion o Evidencia para archivos o Registro de Terceros y Clasificacion para datos del tercero.',
+    'Si el usuario pide una vision del sistema completo, usa resumenSistema, dimensiones, riesgos y el modulo actual para decir que esta completo, que falta y donde revisarlo. No declares que todo esta terminado si el contexto muestra pendientes o datos incompletos.',
+    'ISEGURAS tambien dispone de Uso y Recursos y Set de Pruebas: Uso y Recursos muestra usuarios activos, sesiones, solicitudes, trafico estimado y salud global del servidor; Set de Pruebas valida usuarios, roles, modulos, datos compartidos y concurrencia ligera sin modificar informacion.',
+    'Nunca indiques que un podcast, video o narracion se esta reproduciendo automaticamente. La interfaz exige una accion explicita del usuario para reproducir audio o video.',
+    'Nunca mezcles contratos ni atribuyas a un contrato tipologias, respuestas o progreso de otro. Una tipologia pertenece al contrato en el que fue configurada.',
+    'Conceptos SGRT: una dimension o tipologia es un dominio/categoria de control o riesgo evaluado; el Administrador de Riesgos habilita tipologias por contrato; el Evaluador diligencia controles y evidencias; el Analisis de Riesgos utiliza terceros, contratos y tipologias configurados.',
+    'En temas de riesgo, control interno, ciberseguridad, tecnologia, software, bases de datos, nube o sistemas de informacion, puedes explicar conceptos, ejemplos, buenas practicas y alternativas; diferencia siempre los conceptos generales de los datos reales del SGRT.',
+    'Cuando se solicite un informe, acta, carta, minuta, procedimiento, plan, matriz, propuesta, correo, presentacion, guion o contenido para video, genera una salida completa y lista para usar, siguiendo exactamente el formato solicitado.',
+    'Si el usuario pide un video, prepara contenido audiovisual breve y claro: titulo, objetivo, escenas o secciones, texto visible y narracion sugerida. La interfaz puede convertir tu respuesta en un video visual y en una presentacion narrada.',
+    'Si el usuario pide un podcast, no hagas una simple lectura. Prepara un PODCAST EXPLICADO: el PRESENTADOR hace preguntas naturales para guiar a alguien que no conoce el tema y el EXPERTO explica paso a paso, aclara terminos, interpreta lo importante y resume aprendizajes. Usa apertura, desarrollo, ejemplos respaldados por la fuente y cierre. Cuando se base en SGRT o archivos, no agregues hechos no respaldados.',
+    'Si el usuario pide una infografia, organiza el contenido en un titulo corto, una bajada, entre 3 y 6 bloques visuales con ideas clave y un cierre. Prioriza frases breves y datos verificables.',
+    'Aprendizaje SGRT: si pide flashcards, quiz, juego, evaluacion, practica o capacitacion, conviertelo en una experiencia pedagogica sobre el SGRT. Usa exclusivamente modulos reales del catalogoModulos para navegacion y fases. Para conceptos de riesgo puedes explicar riesgo, control, evidencia, tercero, tipologia, riesgo inherente, riesgo residual, ambiente de control, analisis y seguimiento. Incluye preguntas claras, respuesta correcta y explicacion corta. No mezcles contratos ni inventes modulos.',
+    'Flashcards personalizadas: si el superadministrador entrega sus propias preguntas o un banco de examen y pide convertirlo en flashcards, conserva el sentido de cada pregunta y genera una respuesta breve y correcta solo dentro del SGRT/gestion de riesgos. Si se solicita formato de importacion para el constructor, devuelve exclusivamente una tarjeta por linea con: TARJETA | pregunta | respuesta. Omite preguntas externas al alcance en vez de contestarlas.',
+    'Si pide aprender todo el sistema, adapta el recorrido al rol detectado y al catalogoModulos recibido: explica para que sirve cada modulo, que fase representa, que hace normalmente el usuario alli y como se conecta con el siguiente paso.',
+    'Si el usuario pide un reporte o informe, genera una pieza profesional lista para presentar: titulo, resumen ejecutivo, contexto/alcance, hallazgos, analisis e interpretacion, implicaciones o riesgos, recomendaciones/acciones y conclusion. Conserva exactamente cifras y referencias disponibles. Si falta informacion, indicalo expresamente en lugar de inventarla.',
+    'Si pide Excel, hoja de calculo o archivo XLSX, organiza la informacion real del SGRT en tablas claras: portada/resumen, terceros, contratos, ambiente de control, riesgos y seguimiento segun los datos disponibles. No inventes filas ni cifras; la interfaz se encarga de construir el archivo Excel.',
+    'Si pide un entregable corporativo ISEGURAS, conserva tono ejecutivo y estructura de Infraestructuras Seguras; la interfaz puede aplicar las plantillas corporativas de Word y PowerPoint ya instaladas.',
+    'Si el usuario pide un resumen o una explicacion de algo que esta viendo, y la respuesta necesita contexto, organiza de forma natural con secciones como: Que estas viendo, Resumen, Que significa, Puntos clave y Que hacer a continuacion. No fuerces esta estructura en saludos o preguntas simples.',
+    'Modo Studio: cuando la solicitud diga que debes transformar una FUENTE en resumen, podcast, infografia o video, usa EXCLUSIVAMENTE esa FUENTE para los hechos. Puedes reorganizar, simplificar y explicar, pero no incorporar datos externos no presentes en la fuente.',
+    'Si hay archivos adjuntos, leelos y basa el analisis en su contenido. Puedes resumirlos, explicar que contienen, detectar hallazgos, inconsistencias, riesgos, controles, faltantes y oportunidades de mejora, y sugerir como aprovecharlos dentro del SGRT. Si son varios, relaciona coincidencias, diferencias y pendientes sin inventar contenido ausente.',
+    'Si un archivo adjunto contiene informacion que no corresponde al SGRT, analiza solamente lo que sea util desde la perspectiva de gestion de riesgos, controles, cumplimiento, terceros o documentacion del sistema; no uses el archivo como excusa para responder temas externos.',
+    'Estilo: espanol claro, cercano y profesional. Evita sonar robotico, evita frases de relleno y no repitas la pregunta del usuario innecesariamente.',
+    'Formato: para respuestas de mas de dos oraciones empieza con un titulo Markdown breve (### Titulo). Para saludos o respuestas muy cortas no hace falta titulo. Usa listas o tablas solo cuando ayuden.',
+    'No uses emojis como decoracion. No menciones el proveedor del modelo ni digas que eres una IA salvo que el usuario lo pregunte expresamente.',
+    'Mantiene continuidad con la conversacion previa: recuerda el tema y referencias recientes dentro del historial recibido, pero da prioridad absoluta a la solicitud actual.',
+    'Contexto SGRT (JSON): '+JSON.stringify(context||{}),
+    previous ? ('Conversacion previa:\n'+previous) : '',
+    'Solicitud actual: '+String(prompt||'')
+  ].filter(Boolean).join('\n');
+}
+
+function parseDataUrl(dataUrl){
+  const raw=String(dataUrl||'');
+  const m=raw.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$/s);
+  if(!m) return null;
+  return {mimeType:String(m[1]||'application/octet-stream'),base64:m[2]};
+}
+
+function openaiOutputText(data){
+  if(data&&typeof data.output_text==='string'&&data.output_text.trim()) return data.output_text.trim();
+  const out=[];
+  (data&&data.output||[]).forEach(item=>{
+    (item&&item.content||[]).forEach(c=>{ if(c&&typeof c.text==='string') out.push(c.text); });
+  });
+  return out.join('\n').trim();
+}
+
+function geminiOutputText(data){
+  const out=[];
+  (data&&data.candidates||[]).forEach(c=>{
+    (c&&c.content&&c.content.parts||[]).forEach(p=>{ if(p&&typeof p.text==='string') out.push(p.text); });
+  });
+  return out.join('\n').trim();
+}
+
+
+function aiNormalizeText(v){
+  return String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+}
+function aiShouldGroundWeb(prompt,context,files){
+  if(!AI_CFG.webGrounding) return false;
+  if(Array.isArray(files)&&files.length) return false;
+  const p=aiNormalizeText(prompt);
+  if(!p.trim()) return false;
+  // Nunca buscar en web para datos operativos o internos del SGRT.
+  const internal=/\b(nit|contrato\s*\d|tercero\s+(actual|seleccionado)|mi contrato|este contrato|porcentaje|avance|respuesta|evidencia|usuario|sesion|recurso|telemetria|base de datos|azure|sharepoint|estado actual|cuanto lleva|quien diligencio|quien entro)\b/.test(p);
+  if(internal) return false;
+  const conceptual=/\b(riesg|gestion de riesgos|risk management|dimension|tipologia|control interno|control de riesgo|terceros|third[- ]party|proveedor|supply chain|cumplimiento|continuidad|ciberseg|seguridad de la informacion|iso\s*31000|iso\s*27001|coso|probabilidad|impacto|inherente|residual|apetito|tolerancia|kri|mitigacion|tratamiento|amenaza|vulnerabilidad)\b/.test(p);
+  const research=/\b(que es|que significa|para que sirve|por que|como funciona|explica|investiga|busca|fuente|norma|estandar|buenas practicas|referencia|actualiz)\b/.test(p);
+  return conceptual && research;
+}
+function aiWebSafeContext(context){
+  const c=context&&typeof context==='object'?context:{};
+  return {
+    rol:c.rol||'',
+    moduloActual:c.moduloActual||null,
+    catalogoModulos:Array.isArray(c.catalogoModulos)?c.catalogoModulos.slice(0,30):[],
+    conceptos:c.conceptos||null
+  };
+}
+function uniqueSources(items){
+  const out=[],seen=new Set();
+  (items||[]).forEach(x=>{if(!x||!x.url)return;const u=String(x.url);if(seen.has(u))return;seen.add(u);out.push({title:String(x.title||'Fuente'),url:u});});
+  return out.slice(0,5);
+}
+function geminiSources(data){
+  const out=[];
+  (data&&data.candidates||[]).forEach(c=>{
+    const gm=c&&c.groundingMetadata;
+    (gm&&gm.groundingChunks||[]).forEach(ch=>{const w=ch&&ch.web;if(w&&w.uri)out.push({title:w.title||'Fuente web',url:w.uri});});
+  });
+  return uniqueSources(out);
+}
+function openaiSources(data){
+  const out=[];
+  (data&&data.output||[]).forEach(item=>{
+    (item&&item.content||[]).forEach(c=>{
+      (c&&c.annotations||[]).forEach(a=>{
+              });
+    });
+  });
+  // Recorre de forma tolerante los formatos de anotaciones actuales de Responses.
+  (data&&data.output||[]).forEach(item=>{
+    (item&&item.content||[]).forEach(c=>{
+      (c&&c.annotations||[]).forEach(a=>{
+        const uc=a&&a.url_citation;
+        const url=(uc&&uc.url)||a.url;
+        const title=(uc&&uc.title)||a.title||'Fuente web';
+        if(url)out.push({title,url});
+      });
+    });
+  });
+  return uniqueSources(out);
+}
+function appendWebSources(text,sources){
+  const src=uniqueSources(sources);
+  if(!src.length) return text;
+  return String(text||'').trim()+'\n\n**Fuentes consultadas**\n'+src.map(x=>'- '+x.title+': '+x.url).join('\n');
+}
+
+async function geminiRespond(prompt,context,files,history){
+  if(!AI_CFG.geminiApiKey) throw new Error('GEMINI_API_KEY no esta configurada en Azure');
+  const arr=(Array.isArray(files)?files:(files?[files]:[])).filter(Boolean).slice(0,4);
+  const useWeb=aiShouldGroundWeb(prompt,context,arr);
+  const safeContext=useWeb?aiWebSafeContext(context):context;
+  const parts=[{text:aiInstruction(prompt,safeContext,history)}];
+  let totalBytes=0;
+  for(const file of arr){
+    if(!file||!file.dataUrl) continue;
+    const parsed=parseDataUrl(file.dataUrl);
+    if(!parsed) throw new Error('Uno de los archivos adjuntos no tiene un formato valido');
+    const bytes=Buffer.from(parsed.base64,'base64').length; totalBytes+=bytes;
+    if(bytes>12*1024*1024) throw new Error('Cada archivo adjunto debe ser de hasta 12 MB');
+    parts.push({inlineData:{mimeType:String(file.type||parsed.mimeType||'application/octet-stream'),data:parsed.base64}});
+  }
+  if(totalBytes>18*1024*1024) throw new Error('Los archivos adjuntos juntos deben ser de hasta 18 MB');
+  const url='https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(AI_CFG.geminiModel)+':generateContent';
+  const body={contents:[{role:'user',parts}],generationConfig:{temperature:0.65}};
+  if(useWeb) body.tools=[{google_search:{}}];
+  const data=await aiFetchJson(url,{
+    method:'POST',
+    headers:{'x-goog-api-key':AI_CFG.geminiApiKey,'Content-Type':'application/json'},
+    body:JSON.stringify(body)
+  });
+  const text=geminiOutputText(data)||'El asistente no devolvio texto.';
+  return useWeb?appendWebSources(text,geminiSources(data)):text;
+}
+
+async function openaiRespond(prompt,context,files,history){
+  if(!AI_CFG.openaiApiKey) throw new Error('OPENAI_API_KEY no esta configurada en Azure');
+  const arr=(Array.isArray(files)?files:(files?[files]:[])).filter(Boolean).slice(0,4);
+  const useWeb=aiShouldGroundWeb(prompt,context,arr);
+  const safeContext=useWeb?aiWebSafeContext(context):context;
+  const content=[{type:'input_text',text:aiInstruction(prompt,safeContext,history)}];
+  let totalBytes=0;
+  for(const file of arr){
+    if(!file||!file.dataUrl) continue;
+    const parsed=parseDataUrl(file.dataUrl); if(parsed) totalBytes+=Buffer.from(parsed.base64,'base64').length;
+    if(/^image\//i.test(String(file.type||''))) content.push({type:'input_image',image_url:String(file.dataUrl)});
+    else if(parsed && (/^text\//i.test(String(file.type||parsed.mimeType||'')) || /(?:json|csv|xml|markdown)/i.test(String(file.type||parsed.mimeType||'')))) {
+      const txt=Buffer.from(parsed.base64,'base64').toString('utf8').slice(0,180000);
+      content.push({type:'input_text',text:'ARCHIVO ADJUNTO: '+String(file.name||'archivo')+'\n---\n'+txt+'\n--- FIN ARCHIVO ---'});
+    } else content.push({type:'input_file',filename:String(file.name||'archivo'),file_data:parsed?('data:'+String(file.type||parsed.mimeType||'application/octet-stream')+';base64,'+parsed.base64):String(file.dataUrl||'')});
+  }
+  if(totalBytes>18*1024*1024) throw new Error('Los archivos adjuntos juntos deben ser de hasta 18 MB');
+  const requestBody={model:AI_CFG.openaiModel,input:[{role:'user',content}],reasoning:{effort:AI_CFG.openaiReasoningEffort||'low'}};
+  if(useWeb) requestBody.tools=[{type:'web_search'}];
+  const data=await aiFetchJson('https://api.openai.com/v1/responses',{
+    method:'POST',headers:{'Authorization':'Bearer '+AI_CFG.openaiApiKey,'Content-Type':'application/json'},
+    body:JSON.stringify(requestBody)
+  });
+  const text=openaiOutputText(data)||'El asistente no devolvio texto.';
+  return useWeb?appendWebSources(text,openaiSources(data)):text;
+}
+
+function aiProviderOrder(prompt,files){
+  if(AI_CFG.provider==='gemini') return AI_CFG.geminiApiKey?['gemini']:[];
+  if(AI_CFG.provider==='openai') return AI_CFG.openaiApiKey?['openai']:[];
+  // En modo auto, OpenAI es el interlocutor principal para mantener un estilo
+  // conversacional consistente. Cuando corresponde, OpenAI usa web_search desde
+  // Responses; Gemini queda como respaldo si OpenAI falla o se satura.
+  const out=[];
+  if(AI_CFG.openaiApiKey) out.push('openai');
+  if(AI_CFG.geminiApiKey) out.push('gemini');
+  return out;
+}
+function aiTransientError(e){
+  const m=String(e&&e.message||e||'').toLowerCase();
+  const st=Number(e&&e.status||0);
+  return st===408||st===409||st===429||st===500||st===502||st===503||st===504||
+    /high demand|temporar|overload|rate limit|resource exhausted|resource_exhausted|unavailable|try again|timeout|timed out|capacity/.test(m);
+}
+function aiSleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+async function aiRespondWithProvider(provider,prompt,context,files,history){
+  if(provider==='gemini') return geminiRespond(prompt,context,files,history);
+  if(provider==='openai') return openaiRespond(prompt,context,files,history);
+  throw new Error('Proveedor de asistencia no reconocido');
+}
+async function aiRespond(prompt,context,files,history){
+  const providers=aiProviderOrder(prompt,files);
+  if(!providers.length) throw new Error('No hay un proveedor de asistencia configurado. Define GEMINI_API_KEY u OPENAI_API_KEY en Azure');
+  let lastError=null;
+  for(const provider of providers){
+    for(let attempt=0;attempt<2;attempt++){
+      try{
+        return await aiRespondWithProvider(provider,prompt,context,files,history);
+      }catch(e){
+        lastError=e;
+        console.warn('Assistant provider '+provider+' attempt '+(attempt+1)+':',e.message);
+        if(!aiTransientError(e)||attempt===1) break;
+        await aiSleep(attempt===0?650:1200);
+      }
+    }
+  }
+  if(lastError){
+    lastError.code=aiTransientError(lastError)?'AI_TEMPORARY_UNAVAILABLE':(lastError.code||'AI_PROVIDER_ERROR');
+    throw lastError;
+  }
+  throw new Error('No fue posible obtener respuesta del asistente');
+}
+
+
+function aiDomainDecision(prompt,files){
+  const p=String(prompt||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  const hasFiles=Array.isArray(files)&&files.length>0;
+  if(hasFiles) return {allowed:true,reason:'files'};
+  if(!p.trim()) return {allowed:true,reason:'empty'};
+  if(/^(?:(?:hola|hello|buenas|buenos dias|buenas tardes|buenas noches)(?:[,.! ]+(?:como estas|que tal|como vas))?|como estas|que tal|como vas|bien|muy bien|todo bien|y tu|gracias|muchas gracias|listo|ok|vale)[\s,.!?¿¡]*$/.test(p.trim())) return {allowed:true,reason:'greeting'};
+  if(/\b(me siento triste|estoy triste|me siento mal|estoy frustrad|me frustra|estoy cansad|me siento cansad|me abruma|estoy estresad|me siento estresad)\b/.test(p)) return {allowed:true,reason:'supportive'};
+  const domain=/\b(sgrt|riesg|tercer|proveedor|contrat|tipolog|clasific|control|ambiente de control|evidenc|documentacion|cumplim|auditor|continuidad|ciberseg|seguridad de la informacion|matriz|probabilidad|impacto|inherente|residual|tratamiento|mitig|seguimiento|hallazgo|incidente|vulnerab|amenaza|activo|iso 27001|iso 31000|power bi|reporte|informe|evaluador|administrador de riesgos|usuario|rol|sharepoint|azure|base de datos|pregunta|cuestionario|no aplica|observacion|soporte|expediente|hoja de vida|politica de riesgo|apetito de riesgo|tolerancia de riesgo|kri|kpi)\b/.test(p);
+  const navigation=/\b(donde|como uso|como se usa|no entiendo|ayudame|guia|siguiente paso|que hago aqui|mi rol|modulo|pantalla)\b/.test(p)||/no entiendo (?:este |el )?sistema|como se usa (?:este |el )?sistema|ayudame con (?:este |el )?sistema/.test(p);
+  const creation=/\b(reporte|informe|presentacion|powerpoint|ppt|podcast|infografia|video|resumen|acta|matriz|plan de accion|flashcard|flashcards|tarjetas de estudio|quiz|juego|evaluacion|examen|practica|repaso|aprender|estudiar|capacitacion)\b/.test(p);
+  return {allowed:domain||navigation||creation,reason:domain?'domain':navigation?'navigation':creation?'creation':'outside'};
+}
+function aiOutOfScopeText(){
+  return '### Estoy especializado en SGRT\nMi alcance es el **Sistema de Gestion de Riesgos de Terceros** y temas directamente relacionados con **gestion de riesgos, controles, terceros, contratos, evidencias, cumplimiento, continuidad y ciberseguridad aplicada al riesgo**.\n\nNo respondo preguntas externas al sistema o de cultura general.\n\nPuedes preguntarme, por ejemplo: **“¿que es un riesgo?”**, **“¿donde veo las evidencias?”**, **“¿como clasifico un tercero?”**, **“analiza este documento”** o **“genera un reporte del contrato actual”**.';
+}
+
+
+function aiImageProviderOrder(){
+  // Respeta AI_PROVIDER si se fijó explícitamente. En modo auto, OpenAI es el
+  // generador principal y Gemini queda como respaldo.
+  if(AI_CFG.provider==='gemini') return AI_CFG.geminiApiKey?['gemini']:[];
+  if(AI_CFG.provider==='openai') return AI_CFG.openaiApiKey?['openai']:[];
+  const out=[];
+  if(AI_CFG.openaiApiKey) out.push('openai');
+  if(AI_CFG.geminiApiKey) out.push('gemini');
+  return out;
+}
+function geminiOutputImage(data){
+  for(const c of (data&&data.candidates||[])){
+    for(const p of (c&&c.content&&c.content.parts||[])){
+      const d=p&&(p.inlineData||p.inline_data);
+      if(d&&d.data) return {mimeType:String(d.mimeType||d.mime_type||'image/png'),base64:String(d.data)};
+    }
+  }
+  return null;
+}
+async function geminiGenerateImage(prompt){
+  if(!AI_CFG.geminiApiKey) throw new Error('GEMINI_API_KEY no esta configurada en Azure');
+  const url='https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(AI_CFG.geminiImageModel)+':generateContent';
+  const safePrompt=[
+    'Crea una imagen profesional para uso dentro de un Sistema de Gestion de Riesgos de Terceros (SGRT).',
+    'Debe ser clara, corporativa, util para explicar riesgos, controles, terceros, contratos, cumplimiento, continuidad, ciberseguridad o procesos SGRT.',
+    'No incluyas logos de terceros ni datos personales inventados. Si hay texto visible, mantenlo breve y legible en español.',
+    'Solicitud del usuario: '+String(prompt||'')
+  ].join('\n');
+  const data=await aiFetchJson(url,{method:'POST',headers:{'x-goog-api-key':AI_CFG.geminiApiKey,'Content-Type':'application/json'},body:JSON.stringify({contents:[{role:'user',parts:[{text:safePrompt}]}],generationConfig:{responseModalities:['IMAGE']}})});
+  const img=geminiOutputImage(data);
+  if(!img) throw new Error('Gemini no devolvio una imagen');
+  return {provider:'gemini',model:AI_CFG.geminiImageModel,...img};
+}
+async function openaiGenerateImage(prompt){
+  if(!AI_CFG.openaiApiKey) throw new Error('OPENAI_API_KEY no esta configurada en Azure');
+  const safePrompt=[
+    'Professional visual for a Third-Party Risk Management System (SGRT).',
+    'Corporate, clean, clear, suitable for explaining risks, controls, vendors, contracts, compliance, business continuity or cybersecurity.',
+    'Use Spanish only if visible text is necessary, and keep text short and readable.',
+    'User request: '+String(prompt||'')
+  ].join('\n');
+  const data=await aiFetchJson('https://api.openai.com/v1/images/generations',{method:'POST',headers:{'Authorization':'Bearer '+AI_CFG.openaiApiKey,'Content-Type':'application/json'},body:JSON.stringify({model:AI_CFG.openaiImageModel,prompt:safePrompt})});
+  const item=data&&data.data&&data.data[0];
+  if(!item||!item.b64_json) throw new Error('OpenAI no devolvio una imagen');
+  return {provider:'openai',model:AI_CFG.openaiImageModel,mimeType:'image/png',base64:String(item.b64_json)};
+}
+async function aiGenerateImage(prompt){
+  const providers=aiImageProviderOrder();
+  if(!providers.length) throw new Error('No hay proveedor de imagen configurado. Define GEMINI_API_KEY u OPENAI_API_KEY en Azure');
+  let last=null;
+  for(const provider of providers){
+    try{return provider==='gemini'?await geminiGenerateImage(prompt):await openaiGenerateImage(prompt);}
+    catch(e){last=e;console.warn('Image provider '+provider+':',e.message);if(!aiTransientError(e)) continue;}
+  }
+  throw last||new Error('No fue posible generar la imagen');
+}
+
+app.post('/api/ai/image',async(req,res)=>{
+  try{
+    if(!aiConfigured()) return res.status(503).json({ok:false,code:'AI_NOT_CONFIGURED',error:'Configura GEMINI_API_KEY u OPENAI_API_KEY en Azure App Service'});
+    const prompt=String(req.body&&req.body.prompt||'').trim();
+    if(!prompt) return res.status(400).json({ok:false,error:'Escribe qué imagen quieres generar'});
+    // El generador está especializado en materiales visuales SGRT; la instrucción se
+    // añade en el servidor para que el frontend nunca tenga que exponer claves.
+    const img=await aiGenerateImage(prompt);
+    res.json({ok:true,provider:img.provider,model:img.model,mimeType:img.mimeType,dataUrl:'data:'+img.mimeType+';base64,'+img.base64});
+  }catch(e){
+    console.error('Assistant image:',e.message);
+    res.status(e.status||500).json({ok:false,code:e.code||'AI_IMAGE_ERROR',error:e.message});
+  }
+});
+
+app.get('/api/ai/status',(req,res)=>res.json({
+  ok:true,
+  configured:aiConfigured(),
+  provider:aiConfigured()?aiProvider():'',
+  providerMode:AI_CFG.provider,
+  model:aiConfigured()?aiModel():'',
+  webGrounding:AI_CFG.webGrounding,
+  models:{gemini:AI_CFG.geminiApiKey?AI_CFG.geminiModel:'',openai:AI_CFG.openaiApiKey?AI_CFG.openaiModel:''},
+  providers:{gemini:!!AI_CFG.geminiApiKey,openai:!!AI_CFG.openaiApiKey},
+  image:{
+    configured:!!(AI_CFG.geminiApiKey||AI_CFG.openaiApiKey),
+    geminiModel:AI_CFG.geminiApiKey?AI_CFG.geminiImageModel:'',
+    openaiModel:AI_CFG.openaiApiKey?AI_CFG.openaiImageModel:''
+  }
+}));
+
+app.post('/api/ai/assist',async(req,res)=>{
+  try{
+    if(!aiConfigured()) return res.status(503).json({ok:false,code:'AI_NOT_CONFIGURED',error:'Configura GEMINI_API_KEY u OPENAI_API_KEY en Azure App Service'});
+    const body=req.body||{};
+    const incomingFiles=Array.isArray(body.files)&&body.files.length?body.files:(body.file?[body.file]:[]);
+    // No hacemos un bloqueo léxico rígido antes del modelo: ese filtro causaba falsos
+    // negativos con saludos (“holaa”), typos (“riegso”) y conceptos válidos (“dimensión”).
+    // El alcance SGRT sigue siendo una instrucción de sistema de máxima prioridad para
+    // Gemini/OpenAI, que entiende mucho mejor la intención semántica que una regex.
+    const text=await aiRespond(body.prompt||'',body.context||{},incomingFiles,body.history||[]);
+    res.json({ok:true,text});
+  }catch(e){
+    console.error('Assistant:',e.message);
+    const transient=aiTransientError(e);
+    res.status(transient?503:(e.status||500)).json({
+      ok:false,
+      code:transient?'AI_TEMPORARY_UNAVAILABLE':(e.code||'AI_PROVIDER_ERROR'),
+      transient,
+      error:transient?'El servicio generativo está temporalmente ocupado. El asistente puede continuar con la guía local del SGRT.':e.message,
+      detail:transient?String(e.message||''):''
+    });
+  }
+});
+
+app.post('/api/ai/transcribe',async(req,res)=>{
+  try{
+    if(!aiConfigured()) return res.status(503).json({ok:false,code:'AI_NOT_CONFIGURED',error:'Configura GEMINI_API_KEY u OPENAI_API_KEY en Azure App Service'});
+    const body=req.body||{},dataUrl=String(body.dataUrl||''),parsed=parseDataUrl(dataUrl);
+    if(!parsed) return res.status(400).json({ok:false,error:'Archivo de audio/video invalido'});
+    const buffer=Buffer.from(parsed.base64,'base64'),provider=aiProvider();
+    let transcript='';
+    if(provider==='gemini'){
+      if(buffer.length>18*1024*1024) return res.status(413).json({ok:false,error:'Para transcripcion directa con Gemini, el archivo debe ser de hasta 18 MB'});
+      transcript=await geminiRespond(
+        'Transcribe de forma fiel el contenido hablado de esta grabacion. Conserva nombres, cifras, fechas y compromisos cuando sean audibles. Entrega solo la transcripcion, sin inventar informacion.',
+        body.context||{},
+        [{name:String(body.fileName||'reunion'),type:String(body.mimeType||parsed.mimeType),dataUrl}],
+        body.history||[]
+      );
+    }else{
+      if(buffer.length>24*1024*1024) return res.status(413).json({ok:false,error:'Para transcripcion directa, el archivo debe ser de hasta 24 MB'});
+      if(typeof FormData!=='function'||typeof Blob!=='function') throw new Error('El servidor requiere Node 18+ para transcribir archivos');
+      const form=new FormData();
+      form.append('file',new Blob([buffer],{type:String(body.mimeType||parsed.mimeType||'application/octet-stream')}),String(body.fileName||'reunion.mp4'));
+      form.append('model',AI_CFG.openaiTranscriptionModel);
+      const tr=await aiFetchJson('https://api.openai.com/v1/audio/transcriptions',{
+        method:'POST',headers:{'Authorization':'Bearer '+AI_CFG.openaiApiKey},body:form
+      });
+      transcript=String(tr.text||'').trim();
+    }
+    const summary=await aiRespond([
+      'Genera un acta o informe practico a partir de la siguiente transcripcion.',
+      'Incluye: objetivo, temas tratados, decisiones, compromisos, responsable si se menciona, fechas si se mencionan, riesgos/hallazgos y proximos pasos.',
+      'No inventes nombres, fechas ni compromisos.',
+      body.prompt?('Instruccion adicional: '+body.prompt):'',
+      'TRANSCRIPCION:',transcript
+    ].join('\n'),body.context||{},null,body.history||[]);
+    res.json({ok:true,transcript,summary});
+  }catch(e){console.error('Transcribe:',e.message);res.status(e.status||500).json({ok:false,error:e.message});}
+});
+
+// ================================================================
+// 404
+// ================================================================
+
+app.use(
+  (req, res) => {
+
+    res.status(404).json({
+
+      ok: false,
+
+      error:
+        'Ruta no encontrada',
+
+      path:
+        req.path
+
+    });
+
+  }
+);
+
+// ================================================================
+// ERROR GLOBAL
+// ================================================================
+
+app.use(
+  (err, req, res, next) => {
+
+    console.error(
+      '❌ Error no manejado:',
+      err
+    );
+
+    res.status(500).json({
+
+      ok: false,
+
+      error:
+        'Error interno del servidor',
+
+      message:
+        err.message
+
+    });
+
+  }
+);
+
+// ================================================================
+// INICIAR SERVIDOR
+// ================================================================
+
+async function startServer() {
+
+  try {
+
+    const connected =
+      await initializeDatabase();
+
+    if (!connected) {
+
+      console.error(
+        '❌ Servidor detenido porque no existe conexión con Azure SQL.'
+      );
+
+      process.exit(1);
+
+    }
+
+    const server =
+      app.listen(
+        PORT,
+        () => {
+
+          console.log('');
+          console.log(
+            '================================================'
+          );
+
+          console.log(
+            '🚀 SGRT v10 INICIADO'
+          );
+
+          console.log(
+            '================================================'
+          );
+
+          console.log(
+            `🌐 Puerto: ${PORT}`
+          );
+
+          console.log(
+            `🗄️ Base de datos: ${config.database}`
+          );
+
+          console.log(
+            `📍 Servidor: ${config.server}`
+          );
+
+          console.log(
+            '🔐 Microsoft Entra ID / Managed Identity'
+          );
+
+          console.log('');
+          console.log(
+            'Health: /health'
+          );
+
+          console.log(
+            'Test BD: /test-db'
+          );
+
+          console.log(
+            'Status: /api/status'
+          );
+
+          console.log(
+            'Tablas: /api/database/tables'
+          );
+
+          console.log(
+            'Schema: /api/database/schema'
+          );
+
+          console.log(
+            'Terceros: /api/terceros'
+          );
+
+          console.log('');
+          console.log(
+            '✅ Azure SQL conectado correctamente'
+          );
+
+          console.log(
+            '================================================'
+          );
+
+        }
+      );
+
+    // ------------------------------------------------------------
+    // CIERRE LIMPIO
+    // ------------------------------------------------------------
+
+    process.on(
+      'SIGTERM',
+      async () => {
+
+        console.log(
+          '🛑 SIGTERM recibido'
+        );
+
+        try {
+
+          if (pool) {
+
+            await pool.close();
+
+            console.log(
+              '✅ Pool SQL cerrado'
+            );
+
+          }
+
+          server.close(
+            () => {
+
+              console.log(
+                '✅ Servidor cerrado'
+              );
+
+              process.exit(0);
+
+            }
+          );
+
+        } catch (error) {
+
+          console.error(
+            '❌ Error cerrando servidor:',
+            error.message
+          );
+
+          process.exit(1);
+
+        }
+
+      }
+    );
+
+  } catch (error) {
+
+    console.error(
+      '❌ Error iniciando servidor:',
+      error
+    );
+
+    process.exit(1);
+
+  }
+
+}
+
+// ================================================================
+// ERRORES DE NODE
+// ================================================================
+
+process.on(
+  'uncaughtException',
+  error => {
+
+    console.error(
+      '❌ Excepción no capturada:',
+      error
+
+    );
+
+    process.exit(1);
+
+  }
+);
+
+process.on(
+  'unhandledRejection',
+  reason => {
+
+    console.error(
+      '❌ Promesa rechazada:',
+      reason
+
+    );
+
+  }
+);
+
+// ================================================================
+// ARRANCAR
+// ================================================================
+
+startServer();
+
+// ================================================================
+// EXPORTAR
+// ================================================================
+
+module.exports = app;
